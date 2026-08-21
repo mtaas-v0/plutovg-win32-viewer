@@ -36,4 +36,20 @@ if(MSVC)
     target_compile_options(PlutoVGViewer PRIVATE /W4)
 else()
     target_compile_options(PlutoVGViewer PRIVATE -Wall -Wextra)
+
+    # Ensure this block runs when deploying your executable target (e.g., "my_app")
+    install(TARGETS PlutoVGViewer DESTINATION bin)
+    
+    # Dynamically resolve and copy libwinpthread, libgcc, etc.
+    install(CODE [[
+        file(GET_RUNTIME_DEPENDENCIES
+            EXECUTABLES $<TARGET_FILE:PlutoVGViewer>
+            RESOLVED_DEPENDENCIES_VAR _resolved_deps
+            UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
+        )
+        foreach(_file ${_resolved_deps})
+            file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/bin" TYPE SHARED_LIBRARY FILES "${_file}")
+        endforeach()
+    ]])
+
 endif()
