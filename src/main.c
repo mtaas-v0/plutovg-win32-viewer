@@ -12,18 +12,19 @@
 #include <plutovg.h>
 #include "font_helper.h"
 
-#define ID_MENU_OPEN_SVG    1001
-#define ID_MENU_OPEN_FONT   1002
-#define ID_MENU_RESET_VIEW  1003
-#define ID_MENU_TOGGLE_GRID 1004
-#define ID_MENU_EXIT        1005
+#define ID_MENU_OPEN_SVG     1001
+#define ID_MENU_OPEN_FONT    1002
+#define ID_MENU_RESET_VIEW   1003
+#define ID_MENU_TOGGLE_GRID  1004
+#define ID_MENU_TOGGLE_LOG   1005
+#define ID_MENU_EXIT         1006
 
 #define MAX_FONTS 64
-#define MAX_SVG_ELEMENTS 1024
+#define MAX_SVG_NODES 2048
 
-// --- Font Lookup Registry ---
+// --- Font Lookup Registry for SVG ---
 typedef struct {
-    char key[128];               // e.g. "cmsy10", "arial", "timesnewroman"
+    char key[128]; // e.g. "cmmi10", "cmsy10", "cmr10"
     char file_path[MAX_PATH];
     plutovg_font_face_t* face;
 } CachedFont;
@@ -34,25 +35,45 @@ typedef struct {
     plutovg_font_face_t* fallback_face;
 } FontRegistry;
 
-// --- SVG Text Element Representation ---
+// --- Node Types in SVG ---
+typedef enum {
+    SVG_NODE_PATH,
+    SVG_NODE_TEXT
+} SvgNodeType;
+
 typedef struct {
+    SvgNodeType type;
+    plutovg_matrix_t matrix;
+
+    // Stroke & Fill
+    bool has_fill;
+    plutovg_color_t fill_color;
+    bool has_stroke;
+    plutovg_color_t stroke_color;
+    float stroke_width;
+    plutovg_line_join_t stroke_join;
+    plutovg_line_cap_t stroke_cap;
+
+    // Path payload
+    plutovg_path_t* path;
+
+    // Text payload
     char text[512];
+    int text_len;
     char font_family[128];
     float font_size;
     bool is_italic;
     int font_weight;
     float x, y;
-    plutovg_color_t color;
-    plutovg_matrix_t matrix;
-    bool has_matrix;
-} SvgTextNode;
+} SvgNode;
 
 typedef struct {
     float width;
     float height;
-    SvgTextNode text_nodes[MAX_SVG_ELEMENTS];
-    int text_node_count;
-    char raw_xml_sample[1024];
+    SvgNode nodes[MAX_SVG_NODES];
+    int node_count;
+    int path_count;
+    int text_count;
 } SvgDocument;
 
 typedef struct {
@@ -77,12 +98,66 @@ typedef struct {
     FontRegistry registry;
     SvgDocument svg;
     bool has_svg_loaded;
+
+    // Preferences & UI
     bool show_grid;
+    bool show_log;                       // Default OFF
+    plutovg_font_face_t* system_mono_face; // Dedicated English monospace UI font
 } AppState;
 
 static AppState g_app;
 
-// --- Helper Utilities ---
+// --- XML Entity Unescaper (Problem A) ---
+// Maps &quot; -> ", &#34; -> byte 34 (single char code for cmmi10 epsilon)
+static int unescape_xml_entities(const char* src, char* dst, size_t dst_max) {
+    size_t d = 0;
+    while (*src && d < dst_max - 1) {
+        if (*src == '&') {
+            if (strncmp(src, "&quot;", 6) == 0) {
+                dst[d++] = '\"'; // 0x22 (decimal 34)
+                src += 6;
+            } else if (strncmp(src, "&amp;", 5) == 0) {
+                dst[d++] = '&';  // 0x26 (decimal 38)
+                src += 5;
+            } else if (strncmp(src, "&apos;", 6) == 0) {
+                dst[d++] = '\''; // 0x27 (decimal 39)
+                src += 6;
+            } else if (strncmp(src, "&lt;", 4) == 0) {
+                dst[d++] = '<';  // 0x3C (decimal 60)
+                src += 4;
+            } else if (strncmp(src, "&gt;", 4) == 0) {
+                dst[d++] = '>';  // 0x3E (decimal 62)
+                src += 4;
+            } else if (strncmp(src, "&#x", 3) == 0 || strncmp(src, "&#X", 3) == 0) {
+                char* end = NULL;
+                long val = strtol(src + 3, &end, 16);
+                if (end && *end == ';') {
+                    dst[d++] = (char)(val & 0xFF);
+                    src = end + 1;
+                } else {
+                    dst[d++] = *src++;
+                }
+            } else if (strncmp(src, "&#", 2) == 0) {
+                char* end = NULL;
+                long val = strtol(src + 2, &end, 10);
+                if (end && *end == ';') {
+                    dst[d++] = (char)(val & 0xFF);
+                    src = end + 1;
+                } else {
+                    dst[d++] = *src++;
+                }
+            } else {
+                dst[d++] = *src++;
+            }
+        } else {
+            dst[d++] = *src++;
+        }
+    }
+    dst[d] = '\0';
+    return (int)d;
+}
+
+// --- Font Management ---
 
 static void sanitize_key(const char* src, char* dst, size_t dst_len) {
     size_t j = 0;
@@ -114,7 +189,6 @@ static void registry_add_font(FontRegistry* reg, const char* name_key, const cha
     char clean_key[128];
     sanitize_key(name_key, clean_key, sizeof(clean_key));
 
-    // Check if already registered
     for (int i = 0; i < reg->count; ++i) {
         if (strcmp(reg->fonts[i].key, clean_key) == 0) {
             return;
@@ -135,9 +209,7 @@ static void registry_add_font(FontRegistry* reg, const char* name_key, const cha
 }
 
 static plutovg_font_face_t* registry_find_font(FontRegistry* reg, const char* family_name) {
-    if (!family_name || strlen(family_name) == 0) {
-        return reg->fallback_face;
-    }
+    if (!family_name || strlen(family_name) == 0) return reg->fallback_face;
 
     char clean_key[128];
     sanitize_key(family_name, clean_key, sizeof(clean_key));
@@ -148,7 +220,6 @@ static plutovg_font_face_t* registry_find_font(FontRegistry* reg, const char* fa
         }
     }
 
-    // Partial prefix matching fallback (e.g. "cmsy" matching "cmsy10")
     for (int i = 0; i < reg->count; ++i) {
         if (strstr(reg->fonts[i].key, clean_key) || strstr(clean_key, reg->fonts[i].key)) {
             return reg->fonts[i].face;
@@ -156,6 +227,24 @@ static plutovg_font_face_t* registry_find_font(FontRegistry* reg, const char* fa
     }
 
     return reg->fallback_face;
+}
+
+// Loads system monospace font strictly for HUD logs
+static void load_system_mono_font(AppState* app) {
+    const char* sys_fonts[] = {
+        "C:\\Windows\\Fonts\\consola.ttf",
+        "C:\\Windows\\Fonts\\cour.ttf",
+        "C:\\Windows\\Fonts\\lucon.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf"
+    };
+
+    for (size_t i = 0; i < sizeof(sys_fonts) / sizeof(sys_fonts[0]); ++i) {
+        if (GetFileAttributesA(sys_fonts[i]) != INVALID_FILE_ATTRIBUTES) {
+            app->system_mono_face = plutovg_font_face_load_from_file(sys_fonts[i], 0);
+            if (app->system_mono_face) return;
+        }
+    }
 }
 
 // Scans <svg_dir>/fonts/*.ttf and <svg_dir>/*.ttf for uninstalled fonts
@@ -193,28 +282,29 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
             }
         }
     }
-
-    // Load Windows system fallback font if nothing local was found
-    if (!app->registry.fallback_face) {
-        FontInfo sys_font;
-        if (FontHelper_GetSystemFont(&sys_font)) {
-            registry_add_font(&app->registry, "system_default", sys_font.font_path);
-        }
-    }
 }
 
-// Helper XML attribute extractor
-static bool extract_attribute(const char* tag_start, const char* attr_name, char* out_val, size_t max_len) {
-    char search_pattern[128];
-    snprintf(search_pattern, sizeof(search_pattern), "%s=\"", attr_name);
-    const char* p = strstr(tag_start, search_pattern);
+// --- SVG Attributes & Transform Parsing ---
+
+static bool extract_attr(const char* tag_start, const char* attr_name, char* out_val, size_t max_len) {
+    char search1[128], search2[128];
+    snprintf(search1, sizeof(search1), " %s=\"", attr_name);
+    snprintf(search2, sizeof(search2), " %s=\'", attr_name);
+
+    const char* p = strstr(tag_start, search1);
+    if (!p) p = strstr(tag_start, search2);
     if (!p) {
-        snprintf(search_pattern, sizeof(search_pattern), "%s=\'", attr_name);
-        p = strstr(tag_start, search_pattern);
+        if (strncmp(tag_start, attr_name, strlen(attr_name)) == 0) {
+            p = tag_start;
+        }
     }
     if (!p) return false;
 
-    p += strlen(search_pattern);
+    p = strchr(p, '=');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\"' || *p == '\'') p++;
+
     size_t i = 0;
     while (*p && *p != '\"' && *p != '\'' && i < max_len - 1) {
         out_val[i++] = *p++;
@@ -223,7 +313,114 @@ static bool extract_attribute(const char* tag_start, const char* attr_name, char
     return true;
 }
 
-// Parses <text ...>content</text> components from SVG
+static void parse_svg_transform(const char* str, plutovg_matrix_t* out_mat) {
+    plutovg_matrix_init_identity(out_mat);
+    if (!str || !*str) return;
+
+    const char* p = str;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+
+        if (strncmp(p, "matrix", 6) == 0) {
+            const char* lp = strchr(p, '(');
+            const char* rp = strchr(p, ')');
+            if (lp && rp && rp > lp) {
+                float a, b, c, d, e, f;
+                char buf[128];
+                size_t len = (size_t)(rp - (lp + 1));
+                if (len < sizeof(buf)) {
+                    strncpy(buf, lp + 1, len);
+                    buf[len] = '\0';
+                    for (size_t i = 0; i < len; ++i) if (buf[i] == ',') buf[i] = ' ';
+                    if (sscanf(buf, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f) == 6) {
+                        plutovg_matrix_t m;
+                        plutovg_matrix_init(&m, a, b, c, d, e, f);
+                        plutovg_matrix_multiply(out_mat, &m, out_mat);
+                    }
+                }
+                p = rp + 1;
+            } else { p++; }
+        } else if (strncmp(p, "scale", 5) == 0) {
+            const char* lp = strchr(p, '(');
+            const char* rp = strchr(p, ')');
+            if (lp && rp && rp > lp) {
+                float sx = 1.0f, sy = 1.0f;
+                char buf[128];
+                size_t len = (size_t)(rp - (lp + 1));
+                if (len < sizeof(buf)) {
+                    strncpy(buf, lp + 1, len);
+                    buf[len] = '\0';
+                    for (size_t i = 0; i < len; ++i) if (buf[i] == ',') buf[i] = ' ';
+                    int cnt = sscanf(buf, "%f %f", &sx, &sy);
+                    if (cnt == 1) sy = sx;
+                    plutovg_matrix_t m;
+                    plutovg_matrix_init_scale(&m, sx, sy);
+                    plutovg_matrix_multiply(out_mat, &m, out_mat);
+                }
+                p = rp + 1;
+            } else { p++; }
+        } else if (strncmp(p, "translate", 9) == 0) {
+            const char* lp = strchr(p, '(');
+            const char* rp = strchr(p, ')');
+            if (lp && rp && rp > lp) {
+                float tx = 0.0f, ty = 0.0f;
+                char buf[128];
+                size_t len = (size_t)(rp - (lp + 1));
+                if (len < sizeof(buf)) {
+                    strncpy(buf, lp + 1, len);
+                    buf[len] = '\0';
+                    for (size_t i = 0; i < len; ++i) if (buf[i] == ',') buf[i] = ' ';
+                    sscanf(buf, "%f %f", &tx, &ty);
+                    plutovg_matrix_t m;
+                    plutovg_matrix_init_translate(&m, tx, ty);
+                    plutovg_matrix_multiply(out_mat, &m, out_mat);
+                }
+                p = rp + 1;
+            } else { p++; }
+        } else {
+            p++;
+        }
+    }
+}
+
+static void parse_color_attr(const char* val, bool* has_paint, plutovg_color_t* color, plutovg_color_t default_color) {
+    if (!val || strlen(val) == 0 || _stricmp(val, "none") == 0) {
+        *has_paint = false;
+        return;
+    }
+    if (_stricmp(val, "currentColor") == 0 || _stricmp(val, "black") == 0) {
+        *has_paint = true;
+        plutovg_color_init_rgb(color, 0, 0, 0);
+        return;
+    }
+    if (_stricmp(val, "white") == 0) {
+        *has_paint = true;
+        plutovg_color_init_rgb(color, 1, 1, 1);
+        return;
+    }
+    if (plutovg_color_parse(color, val, -1)) {
+        *has_paint = true;
+    } else {
+        *has_paint = true;
+        *color = default_color;
+    }
+}
+
+// Frees existing SVG nodes and path resources
+static void free_svg_doc(SvgDocument* doc) {
+    for (int i = 0; i < doc->node_count; ++i) {
+        if (doc->nodes[i].type == SVG_NODE_PATH && doc->nodes[i].path) {
+            plutovg_path_destroy(doc->nodes[i].path);
+            doc->nodes[i].path = NULL;
+        }
+    }
+    doc->node_count = 0;
+    doc->path_count = 0;
+    doc->text_count = 0;
+}
+
+// Parses SVG elements: <path>, <text>, etc. (Problem C)
 static void parse_svg(AppState* app, const char* svg_path) {
     FILE* f = fopen(svg_path, "rb");
     if (!f) return;
@@ -232,94 +429,163 @@ static void parse_svg(AppState* app, const char* svg_path) {
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (size <= 0) {
-        fclose(f);
-        return;
-    }
+    if (size <= 0) { fclose(f); return; }
 
     char* buffer = (char*)malloc(size + 1);
-    if (!buffer) {
-        fclose(f);
-        return;
-    }
+    if (!buffer) { fclose(f); return; }
 
     fread(buffer, 1, size, f);
     buffer[size] = '\0';
     fclose(f);
 
-    app->svg.width = 600;
-    app->svg.height = 400;
-    app->svg.text_node_count = 0;
+    free_svg_doc(&app->svg);
+    app->svg.width = 600.0f;
+    app->svg.height = 400.0f;
 
-    // Viewport dimensions
-    char val[128];
-    if (extract_attribute(buffer, "width", val, sizeof(val))) app->svg.width = (float)atof(val);
-    if (extract_attribute(buffer, "height", val, sizeof(val))) app->svg.height = (float)atof(val);
+    char val[1024];
+    if (extract_attr(buffer, "width", val, sizeof(val))) app->svg.width = (float)atof(val);
+    if (extract_attr(buffer, "height", val, sizeof(val))) app->svg.height = (float)atof(val);
 
     const char* cur = buffer;
-    while ((cur = strstr(cur, "<text")) != NULL) {
-        if (app->svg.text_node_count >= MAX_SVG_ELEMENTS) break;
+    while (*cur && app->svg.node_count < MAX_SVG_NODES) {
+        const char* tag_open = strchr(cur, '<');
+        if (!tag_open) break;
 
-        const char* tag_end = strchr(cur, '>');
-        const char* close_tag = strstr(cur, "</text>");
-        if (!tag_end || !close_tag || close_tag <= tag_end) {
-            cur += 5;
+        // Skip comments <?... or <!--
+        if (strncmp(tag_open, "<!--", 4) == 0) {
+            const char* end_cmt = strstr(tag_open, "-->");
+            cur = end_cmt ? end_cmt + 3 : tag_open + 4;
             continue;
         }
 
-        SvgTextNode* node = &app->svg.text_nodes[app->svg.text_node_count++];
-        memset(node, 0, sizeof(SvgTextNode));
-        node->font_size = 16.0f;
-        node->font_weight = 400;
-        plutovg_color_init_rgb(&node->color, 0.95f, 0.95f, 0.95f);
-        plutovg_matrix_init_identity(&node->matrix);
+        // 1. <path ... />
+        if (strncmp(tag_open, "<path", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
+            const char* tag_end = strchr(tag_open, '>');
+            if (!tag_end) { cur = tag_open + 5; continue; }
 
-        if (extract_attribute(cur, "font-family", val, sizeof(val))) {
-            strncpy(node->font_family, val, sizeof(node->font_family) - 1);
-        }
-        if (extract_attribute(cur, "font-size", val, sizeof(val))) {
-            node->font_size = (float)atof(val);
-        }
-        if (extract_attribute(cur, "font-style", val, sizeof(val))) {
-            if (_stricmp(val, "italic") == 0 || _stricmp(val, "oblique") == 0) node->is_italic = true;
-        }
-        if (extract_attribute(cur, "font-weight", val, sizeof(val))) {
-            node->font_weight = atoi(val);
-        }
-        if (extract_attribute(cur, "x", val, sizeof(val))) {
-            node->x = (float)atof(val);
-        }
-        if (extract_attribute(cur, "y", val, sizeof(val))) {
-            node->y = (float)atof(val);
-        }
+            char tag_buf[2048];
+            size_t tag_len = (size_t)(tag_end - tag_open + 1);
+            if (tag_len < sizeof(tag_buf)) {
+                strncpy(tag_buf, tag_open, tag_len);
+                tag_buf[tag_len] = '\0';
 
-        // Parse transform="matrix(a b c d e f)"
-        if (extract_attribute(cur, "transform", val, sizeof(val))) {
-            char* m = strstr(val, "matrix(");
-            if (m) {
-                m += 7;
-                float a, b, c, d, e, f_val;
-                for (char* p = m; *p; ++p) if (*p == ',') *p = ' ';
-                if (sscanf(m, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f_val) == 6) {
-                    plutovg_matrix_init(&node->matrix, a, b, c, d, e, f_val);
-                    node->has_matrix = true;
+                char d_str[4096];
+                if (extract_attr(tag_buf, "d", d_str, sizeof(d_str))) {
+                    SvgNode* node = &app->svg.nodes[app->svg.node_count++];
+                    memset(node, 0, sizeof(SvgNode));
+                    node->type = SVG_NODE_PATH;
+                    node->path = plutovg_path_create();
+                    plutovg_path_parse(node->path, d_str, -1);
+
+                    // Transforms
+                    if (extract_attr(tag_buf, "transform", val, sizeof(val))) {
+                        parse_svg_transform(val, &node->matrix);
+                    } else {
+                        plutovg_matrix_init_identity(&node->matrix);
+                    }
+
+                    // Stroke
+                    node->stroke_width = 1.0f;
+                    node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
+                    node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
+
+                    if (extract_attr(tag_buf, "stroke-width", val, sizeof(val))) node->stroke_width = (float)atof(val);
+                    if (extract_attr(tag_buf, "stroke-linejoin", val, sizeof(val))) {
+                        if (_stricmp(val, "bevel") == 0) node->stroke_join = PLUTOVG_LINE_JOIN_BEVEL;
+                        else if (_stricmp(val, "round") == 0) node->stroke_join = PLUTOVG_LINE_JOIN_ROUND;
+                    }
+                    if (extract_attr(tag_buf, "stroke-linecap", val, sizeof(val))) {
+                        if (_stricmp(val, "round") == 0) node->stroke_cap = PLUTOVG_LINE_CAP_ROUND;
+                        else if (_stricmp(val, "square") == 0) node->stroke_cap = PLUTOVG_LINE_CAP_SQUARE;
+                    }
+
+                    plutovg_color_t black;
+                    plutovg_color_init_rgb(&black, 0, 0, 0);
+
+                    if (extract_attr(tag_buf, "stroke", val, sizeof(val))) {
+                        parse_color_attr(val, &node->has_stroke, &node->stroke_color, black);
+                    }
+                    if (extract_attr(tag_buf, "fill", val, sizeof(val))) {
+                        parse_color_attr(val, &node->has_fill, &node->fill_color, black);
+                    } else {
+                        // SVG default fill is black if unspecified and not stroked
+                        node->has_fill = !node->has_stroke;
+                        node->fill_color = black;
+                    }
+
+                    app->svg.path_count++;
                 }
+            }
+            cur = tag_end + 1;
+            continue;
+        }
+
+        // 2. <text ...>content</text>
+        if (strncmp(tag_open, "<text", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
+            const char* tag_end = strchr(tag_open, '>');
+            const char* close_tag = strstr(tag_open, "</text>");
+            if (tag_end && close_tag && close_tag > tag_end) {
+                char tag_buf[1024];
+                size_t tag_len = (size_t)(tag_end - tag_open + 1);
+                if (tag_len < sizeof(tag_buf)) {
+                    strncpy(tag_buf, tag_open, tag_len);
+                    tag_buf[tag_len] = '\0';
+
+                    SvgNode* node = &app->svg.nodes[app->svg.node_count++];
+                    memset(node, 0, sizeof(SvgNode));
+                    node->type = SVG_NODE_TEXT;
+                    node->font_size = 1.0f;
+                    node->font_weight = 400;
+                    node->has_fill = true;
+                    plutovg_color_init_rgb(&node->fill_color, 0, 0, 0);
+
+                    if (extract_attr(tag_buf, "font-family", val, sizeof(val))) {
+                        strncpy(node->font_family, val, sizeof(node->font_family) - 1);
+                    }
+                    if (extract_attr(tag_buf, "font-size", val, sizeof(val))) {
+                        node->font_size = (float)atof(val);
+                    }
+                    if (extract_attr(tag_buf, "font-style", val, sizeof(val))) {
+                        if (_stricmp(val, "italic") == 0) node->is_italic = true;
+                    }
+                    if (extract_attr(tag_buf, "font-weight", val, sizeof(val))) {
+                        node->font_weight = atoi(val);
+                    }
+                    if (extract_attr(tag_buf, "x", val, sizeof(val))) node->x = (float)atof(val);
+                    if (extract_attr(tag_buf, "y", val, sizeof(val))) node->y = (float)atof(val);
+
+                    if (extract_attr(tag_buf, "fill", val, sizeof(val))) {
+                        parse_color_attr(val, &node->has_fill, &node->fill_color, node->fill_color);
+                    }
+
+                    if (extract_attr(tag_buf, "transform", val, sizeof(val))) {
+                        parse_svg_transform(val, &node->matrix);
+                    } else {
+                        plutovg_matrix_init_identity(&node->matrix);
+                    }
+
+                    // Extract & Unescape XML content (e.g. &quot; -> byte 34 / epsilon)
+                    const char* text_start = tag_end + 1;
+                    size_t raw_len = (size_t)(close_tag - text_start);
+                    char raw_text[512];
+                    if (raw_len > sizeof(raw_text) - 1) raw_len = sizeof(raw_text) - 1;
+
+                    while (raw_len > 0 && isspace((unsigned char)*text_start)) { text_start++; raw_len--; }
+                    while (raw_len > 0 && isspace((unsigned char)*(text_start + raw_len - 1))) { raw_len--; }
+
+                    strncpy(raw_text, text_start, raw_len);
+                    raw_text[raw_len] = '\0';
+
+                    // Unescape &quot; into single character code
+                    node->text_len = unescape_xml_entities(raw_text, node->text, sizeof(node->text));
+                    app->svg.text_count++;
+                }
+                cur = close_tag + 7;
+                continue;
             }
         }
 
-        // Parse text content
-        const char* text_start = tag_end + 1;
-        size_t len = (size_t)(close_tag - text_start);
-        if (len > sizeof(node->text) - 1) len = sizeof(node->text) - 1;
-        
-        // Trim leading/trailing whitespace
-        while (len > 0 && isspace((unsigned char)*text_start)) { text_start++; len--; }
-        while (len > 0 && isspace((unsigned char)*(text_start + len - 1))) { len--; }
-
-        strncpy(node->text, text_start, len);
-        node->text[len] = '\0';
-
-        cur = close_tag + 7;
+        cur = tag_open + 1;
     }
 
     free(buffer);
@@ -333,10 +599,10 @@ static void reset_view(AppState* app) {
     app->pan_y = ((float)app->height - app->svg.height) / 2.0f;
 
     if (app->width > 0 && app->height > 0 && app->svg.width > 0 && app->svg.height > 0) {
-        float sx = ((float)app->width * 0.8f) / app->svg.width;
-        float sy = ((float)app->height * 0.8f) / app->svg.height;
+        float sx = ((float)app->width * 0.85f) / app->svg.width;
+        float sy = ((float)app->height * 0.85f) / app->svg.height;
         float fit = (sx < sy) ? sx : sy;
-        if (fit < 1.0f && fit > 0.001f) {
+        if (fit < 1.0f && fit > 0.0001f) {
             app->zoom = fit;
             app->pan_x = ((float)app->width - (app->svg.width * app->zoom)) / 2.0f;
             app->pan_y = ((float)app->height - (app->svg.height * app->zoom)) / 2.0f;
@@ -386,19 +652,56 @@ static void draw_grid(plutovg_canvas_t* canvas) {
         plutovg_canvas_line_to(canvas, extent, y);
     }
     plutovg_canvas_stroke(canvas);
-
-    // X/Y Major axes
-    plutovg_canvas_set_rgb(canvas, 0.7f, 0.25f, 0.25f);
-    plutovg_canvas_move_to(canvas, -extent, 0);
-    plutovg_canvas_line_to(canvas, extent, 0);
-    plutovg_canvas_stroke(canvas);
-
-    plutovg_canvas_set_rgb(canvas, 0.25f, 0.7f, 0.25f);
-    plutovg_canvas_move_to(canvas, 0, -extent);
-    plutovg_canvas_line_to(canvas, 0, extent);
-    plutovg_canvas_stroke(canvas);
-
     plutovg_canvas_restore(canvas);
+}
+
+// Dedicated English Monospace Log & HUD Overlay (Problem B)
+static void draw_debug_log(AppState* app) {
+    if (!app->show_log || !app->system_mono_face) return;
+
+    plutovg_canvas_save(app->canvas);
+    plutovg_canvas_reset_matrix(app->canvas);
+
+    // Dark semi-transparent console box
+    plutovg_canvas_set_rgba(app->canvas, 0.05f, 0.06f, 0.08f, 0.92f);
+    plutovg_canvas_round_rect(app->canvas, 16, 16, 520, 190, 6, 6);
+    plutovg_canvas_fill(app->canvas);
+
+    // Border
+    plutovg_canvas_set_rgba(app->canvas, 0.25f, 0.40f, 0.60f, 0.80f);
+    plutovg_canvas_set_line_width(app->canvas, 1.0f);
+    plutovg_canvas_stroke_rect(app->canvas, 16, 16, 520, 190);
+
+    // Use system monospace font (Consolas / Courier)
+    plutovg_canvas_set_font_face(app->canvas, app->system_mono_face);
+    plutovg_canvas_set_font_size(app->canvas, 12.0f);
+
+    char buf[512];
+    plutovg_canvas_set_rgb(app->canvas, 0.35f, 0.80f, 1.0f);
+    snprintf(buf, sizeof(buf), "[SVG Inspector] %s (%.0fx%.0f)", 
+             app->has_svg_loaded ? app->current_svg_name : "None", app->svg.width, app->svg.height);
+    plutovg_canvas_fill_text(app->canvas, buf, -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 38);
+
+    plutovg_canvas_set_rgb(app->canvas, 0.85f, 0.88f, 0.90f);
+    snprintf(buf, sizeof(buf), "Elements : %d parsed (Paths: %d, Texts: %d)", 
+             app->svg.node_count, app->svg.path_count, app->svg.text_count);
+    plutovg_canvas_fill_text(app->canvas, buf, -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 58);
+
+    snprintf(buf, sizeof(buf), "Fonts Dir: %s (%d loaded in registry)", 
+             app->fonts_dir[0] ? app->fonts_dir : "N/A", app->registry.count);
+    plutovg_canvas_fill_text(app->canvas, buf, -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 78);
+
+    snprintf(buf, sizeof(buf), "Viewport : Zoom=%.1f%%, Pan=(%.1f, %.1f), Rot=%.1f deg", 
+             app->zoom * 100.0f, app->pan_x, app->pan_y, app->rotation_deg);
+    plutovg_canvas_fill_text(app->canvas, buf, -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 98);
+
+    plutovg_canvas_set_rgb(app->canvas, 0.55f, 0.65f, 0.75f);
+    plutovg_canvas_fill_text(app->canvas, "--------------------------------------------------------", -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 118);
+    plutovg_canvas_fill_text(app->canvas, "Navigation: Scroll = Zoom | Left-Drag = Pan | Space = Reset", -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 138);
+    plutovg_canvas_fill_text(app->canvas, "Transform : R/Shift+R = Rotate | S/Shift+S = Shear", -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 158);
+    plutovg_canvas_fill_text(app->canvas, "Toggle Log: Press 'L' or Menu View -> Show Debug Log", -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 178);
+
+    plutovg_canvas_restore(app->canvas);
 }
 
 static void render(AppState* app) {
@@ -407,11 +710,11 @@ static void render(AppState* app) {
     // Viewport background
     plutovg_canvas_save(app->canvas);
     plutovg_canvas_reset_matrix(app->canvas);
-    plutovg_canvas_set_rgb(app->canvas, 0.11f, 0.12f, 0.14f);
+    plutovg_canvas_set_rgb(app->canvas, 0.12f, 0.13f, 0.15f);
     plutovg_canvas_fill_rect(app->canvas, 0, 0, (float)app->width, (float)app->height);
     plutovg_canvas_restore(app->canvas);
 
-    // Apply Navigation Transform (Pan -> Zoom -> Rotate -> Shear)
+    // Viewport transformations
     plutovg_canvas_save(app->canvas);
     plutovg_canvas_translate(app->canvas, app->pan_x, app->pan_y);
     plutovg_canvas_scale(app->canvas, app->zoom, app->zoom);
@@ -423,82 +726,61 @@ static void render(AppState* app) {
         plutovg_canvas_transform(app->canvas, &sm);
     }
 
-    if (app->show_grid) {
-        draw_grid(app->canvas);
-    }
+    if (app->show_grid) draw_grid(app->canvas);
 
-    // Render SVG Artboard
+    // Render SVG Elements
     if (app->has_svg_loaded) {
-        // Document boundaries
+        // Document backing
         plutovg_canvas_save(app->canvas);
-        plutovg_canvas_set_rgb(app->canvas, 0.16f, 0.18f, 0.22f);
+        plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
         plutovg_canvas_fill_rect(app->canvas, 0, 0, app->svg.width, app->svg.height);
-        plutovg_canvas_set_rgb(app->canvas, 0.35f, 0.40f, 0.50f);
-        plutovg_canvas_set_line_width(app->canvas, 1.5f);
-        plutovg_canvas_stroke_rect(app->canvas, 0, 0, app->svg.width, app->svg.height);
         plutovg_canvas_restore(app->canvas);
 
-        // Render each SVG Text Component
-        for (int i = 0; i < app->svg.text_node_count; ++i) {
-            SvgTextNode* node = &app->svg.text_nodes[i];
-            plutovg_font_face_t* face = registry_find_font(&app->registry, node->font_family);
+        for (int i = 0; i < app->svg.node_count; ++i) {
+            SvgNode* node = &app->svg.nodes[i];
 
-            if (face) {
-                plutovg_canvas_save(app->canvas);
+            plutovg_canvas_save(app->canvas);
+            plutovg_canvas_transform(app->canvas, &node->matrix);
 
-                // Apply SVG transform="matrix(...)"
-                if (node->has_matrix) {
-                    plutovg_canvas_transform(app->canvas, &node->matrix);
+            if (node->type == SVG_NODE_PATH && node->path) {
+                if (node->has_fill) {
+                    plutovg_canvas_set_color(app->canvas, &node->fill_color);
+                    plutovg_canvas_fill_path(app->canvas, node->path);
                 }
+                if (node->has_stroke) {
+                    plutovg_canvas_set_color(app->canvas, &node->stroke_color);
+                    plutovg_canvas_set_line_width(app->canvas, node->stroke_width);
+                    plutovg_canvas_set_line_join(app->canvas, node->stroke_join);
+                    plutovg_canvas_set_line_cap(app->canvas, node->stroke_cap);
+                    plutovg_canvas_stroke_path(app->canvas, node->path);
+                }
+            } else if (node->type == SVG_NODE_TEXT) {
+                plutovg_font_face_t* face = registry_find_font(&app->registry, node->font_family);
+                if (face) {
+                    plutovg_canvas_set_font_face(app->canvas, face);
+                    plutovg_canvas_set_font_size(app->canvas, node->font_size);
+                    plutovg_canvas_set_color(app->canvas, &node->fill_color);
 
-                plutovg_canvas_set_font_face(app->canvas, face);
-                plutovg_canvas_set_font_size(app->canvas, node->font_size);
-                plutovg_canvas_set_color(app->canvas, &node->color);
-
-                plutovg_canvas_fill_text(app->canvas, node->text, -1, PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
-                plutovg_canvas_restore(app->canvas);
+                    // Latin-1 passes raw byte indices (0-255) for uninstalled TeX fonts
+                    plutovg_canvas_fill_text(app->canvas, node->text, node->text_len,
+                                            PLUTOVG_TEXT_ENCODING_LATIN1, node->x, node->y);
+                }
             }
+
+            plutovg_canvas_restore(app->canvas);
         }
     }
 
     plutovg_canvas_restore(app->canvas);
 
-    // On-Screen HUD Overlay
-    plutovg_canvas_save(app->canvas);
-    plutovg_canvas_reset_matrix(app->canvas);
-    plutovg_canvas_set_rgba(app->canvas, 0.06f, 0.07f, 0.09f, 0.88f);
-    plutovg_canvas_round_rect(app->canvas, 16, 16, 460, 160, 8, 8);
-    plutovg_canvas_fill(app->canvas);
-
-    if (app->registry.fallback_face) {
-        plutovg_canvas_set_font_face(app->canvas, app->registry.fallback_face);
-        plutovg_canvas_set_font_size(app->canvas, 13.0f);
-
-        char buf[512];
-        plutovg_canvas_set_rgb(app->canvas, 0.35f, 0.75f, 1.0f);
-        snprintf(buf, sizeof(buf), "File: %s", app->has_svg_loaded ? app->current_svg_name : "(None)");
-        plutovg_canvas_fill_text(app->canvas, buf, -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 40);
-
-        plutovg_canvas_set_rgb(app->canvas, 0.90f, 0.90f, 0.92f);
-        snprintf(buf, sizeof(buf), "Discovered Fonts in /fonts/: %d loaded", app->registry.count);
-        plutovg_canvas_fill_text(app->canvas, buf, -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 64);
-
-        snprintf(buf, sizeof(buf), "Zoom: %.1f%% | Pan: (%.0f, %.0f) | Rotation: %.1f deg",
-                 app->zoom * 100.0f, app->pan_x, app->pan_y, app->rotation_deg);
-        plutovg_canvas_fill_text(app->canvas, buf, -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 88);
-
-        plutovg_canvas_set_rgb(app->canvas, 0.60f, 0.65f, 0.72f);
-        plutovg_canvas_fill_text(app->canvas, "Mouse Wheel: Zoom | Left-Drag: Pan | R/Shift+R: Rotate", -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 114);
-        plutovg_canvas_fill_text(app->canvas, "Drag & Drop .svg file or pass via command line", -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 136);
-        plutovg_canvas_fill_text(app->canvas, "Space: Reset View | G: Toggle Grid | Ctrl+O: Open", -1, PLUTOVG_TEXT_ENCODING_UTF8, 28, 158);
-    }
-    plutovg_canvas_restore(app->canvas);
+    // Optional HUD / Debug Log
+    draw_debug_log(app);
 }
 
 static void zoom_at(AppState* app, float sx, float sy, float factor) {
     float new_zoom = app->zoom * factor;
-    if (new_zoom < 0.005f) new_zoom = 0.005f;
-    if (new_zoom > 200.0f) new_zoom = 200.0f;
+    if (new_zoom < 0.001f) new_zoom = 0.001f;
+    if (new_zoom > 500.0f) new_zoom = 500.0f;
 
     app->pan_x = sx - (sx - app->pan_x) * (new_zoom / app->zoom);
     app->pan_y = sy - (sy - app->pan_y) * (new_zoom / app->zoom);
@@ -527,7 +809,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CREATE: {
         DragAcceptFiles(hwnd, TRUE);
         g_app.show_grid = true;
+        g_app.show_log = false; // Default OFF as requested
         g_app.zoom = 1.0f;
+        load_system_mono_font(&g_app);
         return 0;
     }
 
@@ -591,6 +875,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_KEYDOWN: {
         switch (wParam) {
+        case 'L': // Toggle debug log
+            g_app.show_log = !g_app.show_log;
+            CheckMenuItem(GetMenu(hwnd), ID_MENU_TOGGLE_LOG, g_app.show_log ? MF_CHECKED : MF_UNCHECKED);
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
         case 'R': {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             g_app.rotation_deg += shift ? -5.0f : 5.0f;
@@ -622,22 +911,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.show_grid = !g_app.show_grid;
             InvalidateRect(hwnd, NULL, FALSE);
             break;
-        case 'O': {
-            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            char path[MAX_PATH];
-            if (ctrl) {
-                if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path))) {
-                    load_svg_file(&g_app, path);
-                    InvalidateRect(hwnd, NULL, FALSE);
-                }
-            } else {
-                if (browse_file(hwnd, "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0", path, sizeof(path))) {
-                    registry_add_font(&g_app.registry, PathFindFileNameA(path), path);
-                    InvalidateRect(hwnd, NULL, FALSE);
-                }
-            }
-            break;
-        }
         }
         return 0;
     }
@@ -684,6 +957,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.show_grid = !g_app.show_grid;
             InvalidateRect(hwnd, NULL, FALSE);
             break;
+        case ID_MENU_TOGGLE_LOG:
+            g_app.show_log = !g_app.show_log;
+            CheckMenuItem(GetMenu(hwnd), ID_MENU_TOGGLE_LOG, g_app.show_log ? MF_CHECKED : MF_UNCHECKED);
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
         case ID_MENU_EXIT:
             DestroyWindow(hwnd);
             break;
@@ -705,7 +983,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             BITMAPINFO bmi = {0};
             bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
             bmi.bmiHeader.biWidth = w;
-            bmi.bmiHeader.biHeight = -h; // Top-down
+            bmi.bmiHeader.biHeight = -h;
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
@@ -721,7 +999,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 1;
 
     case WM_DESTROY:
+        free_svg_doc(&g_app.svg);
         registry_init(&g_app.registry);
+        if (g_app.system_mono_face) plutovg_font_face_destroy(g_app.system_mono_face);
         if (g_app.canvas) plutovg_canvas_destroy(g_app.canvas);
         if (g_app.surface) plutovg_surface_destroy(g_app.surface);
         PostQuitMessage(0);
@@ -743,6 +1023,7 @@ static void create_app_menu(HWND hwnd) {
 
     AppendMenuA(hViewMenu, MF_STRING, ID_MENU_RESET_VIEW, "&Reset View\t(Space)");
     AppendMenuA(hViewMenu, MF_STRING, ID_MENU_TOGGLE_GRID, "Toggle &Grid\t(G)");
+    AppendMenuA(hViewMenu, MF_STRING | MF_UNCHECKED, ID_MENU_TOGGLE_LOG, "Show Debug &Log\t(L)");
 
     AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, "&File");
     AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hViewMenu, "&View");
@@ -754,7 +1035,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)hPrevInstance;
     (void)lpCmdLine;
 
-    // High-DPI Awareness
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
         typedef BOOL (WINAPI *SetProcessDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
@@ -780,7 +1060,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     HWND hwnd = CreateWindowExA(
         WS_EX_ACCEPTFILES,
         wc.lpszClassName,
-        "PlutoVG Typography & SVG Viewer",
+        "PlutoVG Typography & Vector Viewer",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         1100, 800,
@@ -793,7 +1073,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // First argument passed via Command Line: PlutoVGViewer.exe "path/to/diagram.svg"
+    // Read 1st command line argument (e.g. `PlutoVGViewer.exe "formula.svg"`)
     int argc = 0;
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argvW && argc > 1) {
@@ -803,16 +1083,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const char* ext = PathFindExtensionA(initial_path);
         if (_stricmp(ext, ".svg") == 0) {
             load_svg_file(&g_app, initial_path);
-        } else {
-            discover_fonts_for_svg(&g_app, initial_path);
         }
         LocalFree(argvW);
         InvalidateRect(hwnd, NULL, FALSE);
-    } else {
-        FontInfo sys_font;
-        if (FontHelper_GetSystemFont(&sys_font)) {
-            registry_add_font(&g_app.registry, "system_default", sys_font.font_path);
-        }
     }
 
     MSG msg;
