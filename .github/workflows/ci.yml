@@ -42,11 +42,16 @@ jobs:
           cmake -B build
           -G "${{ matrix.cmake_generator }}"
           -DCMAKE_BUILD_TYPE=Release
+          
       #cmake -B build -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++"
       #static build if bundler not working
 
       - name: Build
         run: cmake --build build --config Release
+
+      - name: mingw package
+        if: matrix.compiler == 'mingw'
+        run: cmake --install build --prefix dist
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
