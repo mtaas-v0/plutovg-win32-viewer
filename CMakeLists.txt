@@ -5,12 +5,23 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
+
+# Fetch PlutoVG (2D vector drawing engine)
 FetchContent_Declare(
     plutovg
     GIT_REPOSITORY https://github.com/sammycage/plutovg.git
     GIT_TAG main
 )
-FetchContent_MakeAvailable(plutovg)
+
+# Fetch PlutoSVG (SVG rendering support on top of PlutoVG)
+FetchContent_Declare(
+    plutosvg
+    GIT_REPOSITORY https://github.com/sammycage/plutosvg.git
+    GIT_TAG main
+)
+
+FetchContent_MakeAvailable(plutovg plutosvg)
+
 
 set(SOURCES
     src/main.c
@@ -21,7 +32,7 @@ set(SOURCES
 add_executable(PlutoVGViewer WIN32 ${SOURCES})
 
 target_include_directories(PlutoVGViewer PRIVATE src)
-target_link_libraries(PlutoVGViewer PRIVATE plutovg)
+target_link_libraries(PlutoVGViewer PRIVATE plutovg plutosvg)
 
 # Windows system libraries
 target_link_libraries(PlutoVGViewer PRIVATE
