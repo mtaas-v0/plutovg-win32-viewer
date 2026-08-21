@@ -25,7 +25,7 @@
 
 #define IDC_LOG_EDIT         2001
 #define MAX_FONTS            64
-#define MAX_SVG_NODES        4096
+#define MAX_SVG_NODES        8192
 
 // --- Font Lookup Registry for SVG ---
 typedef struct {
@@ -50,9 +50,10 @@ typedef struct {
     SvgNodeType type;
     plutovg_matrix_t matrix;
 
-    // Stroke & Fill
+    // Stroke & Fill & Winding Rule
     bool has_fill;
     plutovg_color_t fill_color;
+    plutovg_fill_rule_t fill_rule;
     bool has_stroke;
     plutovg_color_t stroke_color;
     float stroke_width;
@@ -121,7 +122,7 @@ typedef struct {
 } PathStringBuffer;
 
 static void psb_init(PathStringBuffer* b, size_t initial_cap) {
-    b->capacity = initial_cap ? initial_cap : 4096;
+    b->capacity = initial_cap ? initial_cap : 16384;
     b->size = 0;
     b->data = (char*)malloc(b->capacity);
     if (b->data) b->data[0] = '\0';
@@ -400,93 +401,102 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
     }
 }
 
-// --- Attribute and Transform Parsing ---
+// --- Zero-Copy Attribute & Transform Locator (No buffer truncations) ---
 
-static bool extract_attr(const char* tag_start, const char* attr_name, char* out_val, size_t max_len) {
-    char search1[128], search2[128];
-    snprintf(search1, sizeof(search1), " %s=\"", attr_name);
-    snprintf(search2, sizeof(search2), " %s=\'", attr_name);
+static const char* find_attr_slice(const char* tag_start, const char* tag_end, const char* attr_name, size_t* out_len) {
+    if (!tag_start || !tag_end || tag_start >= tag_end || !attr_name) return NULL;
+    size_t name_len = strlen(attr_name);
 
-    const char* p = strstr(tag_start, search1);
-    if (!p) p = strstr(tag_start, search2);
-    if (!p && strncmp(tag_start, attr_name, strlen(attr_name)) == 0) p = tag_start;
-    if (!p) return false;
-
-    p = strchr(p, '=');
-    if (!p) return false;
-    p++;
-    while (*p == ' ' || *p == '\"' || *p == '\'') p++;
-
-    size_t i = 0;
-    while (*p && *p != '\"' && *p != '\'' && i < max_len - 1) {
-        out_val[i++] = *p++;
+    const char* p = tag_start;
+    while (p < tag_end) {
+        if (p + name_len < tag_end && strncmp(p, attr_name, name_len) == 0 &&
+            (p == tag_start || isspace((unsigned char)*(p - 1)))) {
+            const char* eq = p + name_len;
+            while (eq < tag_end && isspace((unsigned char)*eq)) eq++;
+            if (eq < tag_end && *eq == '=') {
+                const char* quote = eq + 1;
+                while (quote < tag_end && isspace((unsigned char)*quote)) quote++;
+                if (quote < tag_end && (*quote == '\"' || *quote == '\'')) {
+                    char qchar = *quote;
+                    const char* val_start = quote + 1;
+                    const char* val_end = val_start;
+                    while (val_end < tag_end && *val_end != qchar) val_end++;
+                    if (val_end <= tag_end) {
+                        *out_len = (size_t)(val_end - val_start);
+                        return val_start;
+                    }
+                }
+            }
+        }
+        p++;
     }
-    out_val[i] = '\0';
-    return true;
+    return NULL;
 }
 
-static void parse_svg_transform(const char* str, plutovg_matrix_t* out_mat) {
+static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* out_mat) {
     plutovg_matrix_init_identity(out_mat);
-    if (!str || !*str) return;
+    if (!str || len == 0) return;
 
+    const char* end = str + len;
     const char* p = str;
-    while (*p) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
 
-        if (strncmp(p, "matrix", 6) == 0) {
-            const char* lp = strchr(p, '(');
-            const char* rp = strchr(p, ')');
+    while (p < end) {
+        while (p < end && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (p >= end) break;
+
+        if (p + 6 <= end && strncmp(p, "matrix", 6) == 0) {
+            const char* lp = (const char*)memchr(p, '(', (size_t)(end - p));
+            const char* rp = lp ? (const char*)memchr(lp, ')', (size_t)(end - lp)) : NULL;
             if (lp && rp && rp > lp) {
                 float a, b, c, d, e, f;
                 char buf[128];
-                size_t len = (size_t)(rp - (lp + 1));
-                if (len < sizeof(buf)) {
-                    strncpy(buf, lp + 1, len);
-                    buf[len] = '\0';
-                    for (size_t i = 0; i < len; ++i) if (buf[i] == ',') buf[i] = ' ';
+                size_t arg_len = (size_t)(rp - (lp + 1));
+                if (arg_len < sizeof(buf)) {
+                    strncpy(buf, lp + 1, arg_len);
+                    buf[arg_len] = '\0';
+                    for (size_t i = 0; i < arg_len; ++i) if (buf[i] == ',') buf[i] = ' ';
                     if (sscanf(buf, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f) == 6) {
                         plutovg_matrix_t m;
                         plutovg_matrix_init(&m, a, b, c, d, e, f);
-                        plutovg_matrix_multiply(out_mat, &m, out_mat);
+                        plutovg_matrix_multiply(out_mat, out_mat, &m);
                     }
                 }
                 p = rp + 1;
             } else { p++; }
-        } else if (strncmp(p, "scale", 5) == 0) {
-            const char* lp = strchr(p, '(');
-            const char* rp = strchr(p, ')');
+        } else if (p + 5 <= end && strncmp(p, "scale", 5) == 0) {
+            const char* lp = (const char*)memchr(p, '(', (size_t)(end - p));
+            const char* rp = lp ? (const char*)memchr(lp, ')', (size_t)(end - lp)) : NULL;
             if (lp && rp && rp > lp) {
                 float sx = 1.0f, sy = 1.0f;
                 char buf[128];
-                size_t len = (size_t)(rp - (lp + 1));
-                if (len < sizeof(buf)) {
-                    strncpy(buf, lp + 1, len);
-                    buf[len] = '\0';
-                    for (size_t i = 0; i < len; ++i) if (buf[i] == ',') buf[i] = ' ';
+                size_t arg_len = (size_t)(rp - (lp + 1));
+                if (arg_len < sizeof(buf)) {
+                    strncpy(buf, lp + 1, arg_len);
+                    buf[arg_len] = '\0';
+                    for (size_t i = 0; i < arg_len; ++i) if (buf[i] == ',') buf[i] = ' ';
                     int cnt = sscanf(buf, "%f %f", &sx, &sy);
                     if (cnt == 1) sy = sx;
                     plutovg_matrix_t m;
                     plutovg_matrix_init_scale(&m, sx, sy);
-                    plutovg_matrix_multiply(out_mat, &m, out_mat);
+                    plutovg_matrix_multiply(out_mat, out_mat, &m);
                 }
                 p = rp + 1;
             } else { p++; }
-        } else if (strncmp(p, "translate", 9) == 0) {
-            const char* lp = strchr(p, '(');
-            const char* rp = strchr(p, ')');
+        } else if (p + 9 <= end && strncmp(p, "translate", 9) == 0) {
+            const char* lp = (const char*)memchr(p, '(', (size_t)(end - p));
+            const char* rp = lp ? (const char*)memchr(lp, ')', (size_t)(end - lp)) : NULL;
             if (lp && rp && rp > lp) {
                 float tx = 0.0f, ty = 0.0f;
                 char buf[128];
-                size_t len = (size_t)(rp - (lp + 1));
-                if (len < sizeof(buf)) {
-                    strncpy(buf, lp + 1, len);
-                    buf[len] = '\0';
-                    for (size_t i = 0; i < len; ++i) if (buf[i] == ',') buf[i] = ' ';
+                size_t arg_len = (size_t)(rp - (lp + 1));
+                if (arg_len < sizeof(buf)) {
+                    strncpy(buf, lp + 1, arg_len);
+                    buf[arg_len] = '\0';
+                    for (size_t i = 0; i < arg_len; ++i) if (buf[i] == ',') buf[i] = ' ';
                     sscanf(buf, "%f %f", &tx, &ty);
                     plutovg_matrix_t m;
                     plutovg_matrix_init_translate(&m, tx, ty);
-                    plutovg_matrix_multiply(out_mat, &m, out_mat);
+                    plutovg_matrix_multiply(out_mat, out_mat, &m);
                 }
                 p = rp + 1;
             } else { p++; }
@@ -496,22 +506,32 @@ static void parse_svg_transform(const char* str, plutovg_matrix_t* out_mat) {
     }
 }
 
-static void parse_color_attr(const char* val, bool* has_paint, plutovg_color_t* color, plutovg_color_t default_color) {
-    if (!val || strlen(val) == 0 || _stricmp(val, "none") == 0) {
+static void parse_color_slice(const char* val, size_t len, bool* has_paint, plutovg_color_t* color, plutovg_color_t default_color) {
+    if (!val || len == 0) {
         *has_paint = false;
         return;
     }
-    if (_stricmp(val, "currentColor") == 0 || _stricmp(val, "black") == 0) {
+
+    char buf[64];
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    strncpy(buf, val, len);
+    buf[len] = '\0';
+
+    if (_stricmp(buf, "none") == 0) {
+        *has_paint = false;
+        return;
+    }
+    if (_stricmp(buf, "currentColor") == 0 || _stricmp(buf, "black") == 0) {
         *has_paint = true;
         plutovg_color_init_rgb(color, 0, 0, 0);
         return;
     }
-    if (_stricmp(val, "white") == 0) {
+    if (_stricmp(buf, "white") == 0) {
         *has_paint = true;
         plutovg_color_init_rgb(color, 1, 1, 1);
         return;
     }
-    if (plutovg_color_parse(color, val, -1)) {
+    if (plutovg_color_parse(color, buf, (int)len)) {
         *has_paint = true;
     } else {
         *has_paint = true;
@@ -552,9 +572,17 @@ static void parse_svg(AppState* app, const char* svg_path) {
     app->svg.width = 600.0f;
     app->svg.height = 400.0f;
 
-    char val[1024];
-    if (extract_attr(buffer, "width", val, sizeof(val))) app->svg.width = (float)atof(val);
-    if (extract_attr(buffer, "height", val, sizeof(val))) app->svg.height = (float)atof(val);
+    size_t val_len = 0;
+    const char* val_ptr = NULL;
+
+    const char* root_svg = strstr(buffer, "<svg");
+    if (root_svg) {
+        const char* root_end = strchr(root_svg, '>');
+        if (root_end) {
+            if ((val_ptr = find_attr_slice(root_svg, root_end, "width", &val_len))) app->svg.width = (float)atof(val_ptr);
+            if ((val_ptr = find_attr_slice(root_svg, root_end, "height", &val_len))) app->svg.height = (float)atof(val_ptr);
+        }
+    }
 
     log_append("[SVG] Parsing elements (Document size: %.1fx%.1f)", app->svg.width, app->svg.height);
 
@@ -569,60 +597,73 @@ static void parse_svg(AppState* app, const char* svg_path) {
             continue;
         }
 
-        // 1. Parse <path ... />
+        // 1. Parse <path ... /> with ZERO truncation
         if (strncmp(tag_open, "<path", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
             if (!tag_end) { cur = tag_open + 5; continue; }
 
-            char tag_buf[2048];
-            size_t tag_len = (size_t)(tag_end - tag_open + 1);
-            if (tag_len < sizeof(tag_buf)) {
-                strncpy(tag_buf, tag_open, tag_len);
-                tag_buf[tag_len] = '\0';
+            size_t d_len = 0;
+            const char* d_str = find_attr_slice(tag_open, tag_end, "d", &d_len);
+            if (d_str && d_len > 0) {
+                SvgNode* node = &app->svg.nodes[app->svg.node_count++];
+                memset(node, 0, sizeof(SvgNode));
+                node->type = SVG_NODE_PATH;
+                node->path = plutovg_path_create();
+                node->fill_rule = PLUTOVG_FILL_RULE_NON_ZERO;
 
-                char d_str[4096];
-                if (extract_attr(tag_buf, "d", d_str, sizeof(d_str))) {
-                    SvgNode* node = &app->svg.nodes[app->svg.node_count++];
-                    memset(node, 0, sizeof(SvgNode));
-                    node->type = SVG_NODE_PATH;
-                    node->path = plutovg_path_create();
-                    plutovg_path_parse(node->path, d_str, -1);
+                // Parse path directly from XML memory slice
+                plutovg_path_parse(node->path, d_str, (int)d_len);
 
-                    if (extract_attr(tag_buf, "transform", val, sizeof(val))) {
-                        parse_svg_transform(val, &node->matrix);
-                    } else {
-                        plutovg_matrix_init_identity(&node->matrix);
-                    }
-
-                    node->stroke_width = 1.0f;
-                    node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
-                    node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
-
-                    if (extract_attr(tag_buf, "stroke-width", val, sizeof(val))) node->stroke_width = (float)atof(val);
-                    if (extract_attr(tag_buf, "stroke-linejoin", val, sizeof(val))) {
-                        if (_stricmp(val, "bevel") == 0) node->stroke_join = PLUTOVG_LINE_JOIN_BEVEL;
-                        else if (_stricmp(val, "round") == 0) node->stroke_join = PLUTOVG_LINE_JOIN_ROUND;
-                    }
-                    if (extract_attr(tag_buf, "stroke-linecap", val, sizeof(val))) {
-                        if (_stricmp(val, "round") == 0) node->stroke_cap = PLUTOVG_LINE_CAP_ROUND;
-                        else if (_stricmp(val, "square") == 0) node->stroke_cap = PLUTOVG_LINE_CAP_SQUARE;
-                    }
-
-                    plutovg_color_t black;
-                    plutovg_color_init_rgb(&black, 0, 0, 0);
-
-                    if (extract_attr(tag_buf, "stroke", val, sizeof(val))) {
-                        parse_color_attr(val, &node->has_stroke, &node->stroke_color, black);
-                    }
-                    if (extract_attr(tag_buf, "fill", val, sizeof(val))) {
-                        parse_color_attr(val, &node->has_fill, &node->fill_color, black);
-                    } else {
-                        node->has_fill = !node->has_stroke;
-                        node->fill_color = black;
-                    }
-
-                    app->svg.path_count++;
+                // Transform
+                size_t t_len = 0;
+                const char* t_str = find_attr_slice(tag_open, tag_end, "transform", &t_len);
+                if (t_str && t_len > 0) {
+                    parse_svg_transform(t_str, t_len, &node->matrix);
+                } else {
+                    plutovg_matrix_init_identity(&node->matrix);
                 }
+
+                // Fill-rule
+                size_t fr_len = 0;
+                const char* fr_str = find_attr_slice(tag_open, tag_end, "fill-rule", &fr_len);
+                if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) {
+                    node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
+                }
+
+                // Stroke defaults
+                node->stroke_width = 1.0f;
+                node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
+                node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
+
+                size_t a_len = 0;
+                const char* a_str = NULL;
+
+                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-width", &a_len))) {
+                    node->stroke_width = (float)atof(a_str);
+                }
+                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-linejoin", &a_len))) {
+                    if (a_len >= 5 && strncmp(a_str, "bevel", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_BEVEL;
+                    else if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_ROUND;
+                }
+                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-linecap", &a_len))) {
+                    if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_ROUND;
+                    else if (a_len >= 6 && strncmp(a_str, "square", 6) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_SQUARE;
+                }
+
+                plutovg_color_t black;
+                plutovg_color_init_rgb(&black, 0, 0, 0);
+
+                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke", &a_len))) {
+                    parse_color_slice(a_str, a_len, &node->has_stroke, &node->stroke_color, black);
+                }
+                if ((a_str = find_attr_slice(tag_open, tag_end, "fill", &a_len))) {
+                    parse_color_slice(a_str, a_len, &node->has_fill, &node->fill_color, black);
+                } else {
+                    node->has_fill = !node->has_stroke;
+                    node->fill_color = black;
+                }
+
+                app->svg.path_count++;
             }
             cur = tag_end + 1;
             continue;
@@ -633,57 +674,53 @@ static void parse_svg(AppState* app, const char* svg_path) {
             const char* tag_end = strchr(tag_open, '>');
             const char* close_tag = strstr(tag_open, "</text>");
             if (tag_end && close_tag && close_tag > tag_end) {
-                char tag_buf[1024];
-                size_t tag_len = (size_t)(tag_end - tag_open + 1);
-                if (tag_len < sizeof(tag_buf)) {
-                    strncpy(tag_buf, tag_open, tag_len);
-                    tag_buf[tag_len] = '\0';
+                SvgNode* node = &app->svg.nodes[app->svg.node_count++];
+                memset(node, 0, sizeof(SvgNode));
+                node->type = SVG_NODE_TEXT;
+                node->font_size = 1.0f;
+                node->font_weight = 400;
+                node->has_fill = true;
+                node->fill_rule = PLUTOVG_FILL_RULE_NON_ZERO;
+                plutovg_color_init_rgb(&node->fill_color, 0, 0, 0);
 
-                    SvgNode* node = &app->svg.nodes[app->svg.node_count++];
-                    memset(node, 0, sizeof(SvgNode));
-                    node->type = SVG_NODE_TEXT;
-                    node->font_size = 1.0f;
-                    node->font_weight = 400;
-                    node->has_fill = true;
-                    plutovg_color_init_rgb(&node->fill_color, 0, 0, 0);
+                size_t a_len = 0;
+                const char* a_str = NULL;
 
-                    if (extract_attr(tag_buf, "font-family", val, sizeof(val))) {
-                        strncpy(node->font_family, val, sizeof(node->font_family) - 1);
-                    }
-                    if (extract_attr(tag_buf, "font-size", val, sizeof(val))) {
-                        node->font_size = (float)atof(val);
-                    }
-                    if (extract_attr(tag_buf, "font-style", val, sizeof(val))) {
-                        if (_stricmp(val, "italic") == 0) node->is_italic = true;
-                    }
-                    if (extract_attr(tag_buf, "font-weight", val, sizeof(val))) {
-                        node->font_weight = atoi(val);
-                    }
-                    if (extract_attr(tag_buf, "x", val, sizeof(val))) node->x = (float)atof(val);
-                    if (extract_attr(tag_buf, "y", val, sizeof(val))) node->y = (float)atof(val);
-
-                    if (extract_attr(tag_buf, "fill", val, sizeof(val))) {
-                        parse_color_attr(val, &node->has_fill, &node->fill_color, node->fill_color);
-                    }
-
-                    if (extract_attr(tag_buf, "transform", val, sizeof(val))) {
-                        parse_svg_transform(val, &node->matrix);
-                    } else {
-                        plutovg_matrix_init_identity(&node->matrix);
-                    }
-
-                    const char* text_start = tag_end + 1;
-                    size_t raw_len = (size_t)(close_tag - text_start);
-                    node->text_len = clean_and_unescape_text(text_start, raw_len, node->text, sizeof(node->text));
-
-                    if (node->text_len > 0) {
-                        app->svg.text_count++;
-                        log_append("  [TEXT] family='%s', size=%.1f, len=%d, text='%s'",
-                                   node->font_family, node->font_size, node->text_len, node->text);
-                    } else {
-                        app->svg.node_count--;
-                    }
+                if ((a_str = find_attr_slice(tag_open, tag_end, "font-family", &a_len))) {
+                    size_t cplen = a_len < sizeof(node->font_family) - 1 ? a_len : sizeof(node->font_family) - 1;
+                    strncpy(node->font_family, a_str, cplen);
+                    node->font_family[cplen] = '\0';
                 }
+                if ((a_str = find_attr_slice(tag_open, tag_end, "font-size", &a_len))) node->font_size = (float)atof(a_str);
+                if ((a_str = find_attr_slice(tag_open, tag_end, "font-style", &a_len))) {
+                    if (a_len >= 6 && strncmp(a_str, "italic", 6) == 0) node->is_italic = true;
+                }
+                if ((a_str = find_attr_slice(tag_open, tag_end, "font-weight", &a_len))) node->font_weight = atoi(a_str);
+                if ((a_str = find_attr_slice(tag_open, tag_end, "x", &a_len))) node->x = (float)atof(a_str);
+                if ((a_str = find_attr_slice(tag_open, tag_end, "y", &a_len))) node->y = (float)atof(a_str);
+
+                if ((a_str = find_attr_slice(tag_open, tag_end, "fill", &a_len))) {
+                    parse_color_slice(a_str, a_len, &node->has_fill, &node->fill_color, node->fill_color);
+                }
+
+                if ((a_str = find_attr_slice(tag_open, tag_end, "transform", &a_len))) {
+                    parse_svg_transform(a_str, a_len, &node->matrix);
+                } else {
+                    plutovg_matrix_init_identity(&node->matrix);
+                }
+
+                const char* text_start = tag_end + 1;
+                size_t raw_len = (size_t)(close_tag - text_start);
+                node->text_len = clean_and_unescape_text(text_start, raw_len, node->text, sizeof(node->text));
+
+                if (node->text_len > 0) {
+                    app->svg.text_count++;
+                    log_append("  [TEXT] family='%s', size=%.1f, len=%d, text='%s'",
+                               node->font_family, node->font_size, node->text_len, node->text);
+                } else {
+                    app->svg.node_count--;
+                }
+
                 cur = close_tag + 7;
                 continue;
             }
@@ -732,7 +769,7 @@ static void load_svg_file(AppState* app, const char* path) {
     reset_view(app);
 }
 
-// --- Path Traversal Callback for SVG Export (Feature B) ---
+// --- Path Traversal Callback for SVG Export ---
 static void svg_path_traverse_cb(void* closure, plutovg_path_command_t command, const plutovg_point_t* points, int npoints) {
     (void)npoints;
     PathStringBuffer* psb = (PathStringBuffer*)closure;
@@ -740,15 +777,15 @@ static void svg_path_traverse_cb(void* closure, plutovg_path_command_t command, 
 
     switch (command) {
     case PLUTOVG_PATH_COMMAND_MOVE_TO:
-        snprintf(temp, sizeof(temp), "M%.4f %.4f ", points[0].x, points[0].y);
+        snprintf(temp, sizeof(temp), "M%g %g ", points[0].x, points[0].y);
         psb_append(psb, temp);
         break;
     case PLUTOVG_PATH_COMMAND_LINE_TO:
-        snprintf(temp, sizeof(temp), "L%.4f %.4f ", points[0].x, points[0].y);
+        snprintf(temp, sizeof(temp), "L%g %g ", points[0].x, points[0].y);
         psb_append(psb, temp);
         break;
     case PLUTOVG_PATH_COMMAND_CUBIC_TO:
-        snprintf(temp, sizeof(temp), "C%.4f %.4f %.4f %.4f %.4f %.4f ",
+        snprintf(temp, sizeof(temp), "C%g %g %g %g %g %g ",
                  points[0].x, points[0].y, points[1].x, points[1].y, points[2].x, points[2].y);
         psb_append(psb, temp);
         break;
@@ -758,7 +795,7 @@ static void svg_path_traverse_cb(void* closure, plutovg_path_command_t command, 
     }
 }
 
-// --- Export SVG with Glyphs Converted to Vector Paths (Feature B) ---
+// --- Export SVG with Glyphs Converted to Vector Paths ---
 static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) {
     if (!app->has_svg_loaded) return false;
 
@@ -766,53 +803,59 @@ static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) 
     if (!f) return false;
 
     fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.2f\" height=\"%.2f\" viewBox=\"0 0 %.2f %.2f\">\n",
+    fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%g\" height=\"%g\" viewBox=\"0 0 %g %g\">\n",
             app->svg.width, app->svg.height, app->svg.width, app->svg.height);
 
     log_append("[EXPORT] Converting %d elements (with font glyphs -> vector paths)...", app->svg.node_count);
 
-    // Create a temporary canvas to generate text glyph contours
     plutovg_surface_t* temp_surf = plutovg_surface_create(1, 1);
     plutovg_canvas_t* temp_canvas = plutovg_canvas_create(temp_surf);
 
     PathStringBuffer psb;
-    psb_init(&psb, 8192);
+    psb_init(&psb, 32768);
 
     for (int i = 0; i < app->svg.node_count; ++i) {
         SvgNode* node = &app->svg.nodes[i];
         psb.size = 0;
         if (psb.data) psb.data[0] = '\0';
 
-        char color_str[32] = "#000000";
-        if (node->has_fill) {
-            snprintf(color_str, sizeof(color_str), "#%02X%02X%02X",
-                     (int)(node->fill_color.r * 255.0f + 0.5f),
-                     (int)(node->fill_color.g * 255.0f + 0.5f),
-                     (int)(node->fill_color.b * 255.0f + 0.5f));
-        }
-
         if (node->type == SVG_NODE_PATH && node->path) {
             plutovg_path_traverse(node->path, svg_path_traverse_cb, &psb);
 
-            fprintf(f, "  <path transform=\"matrix(%.6f,%.6f,%.6f,%.6f,%.6f,%.6f)\" ",
+            fprintf(f, "  <path transform=\"matrix(%g,%g,%g,%g,%g,%g)\" ",
                     node->matrix.a, node->matrix.b, node->matrix.c, node->matrix.d, node->matrix.e, node->matrix.f);
 
-            if (node->has_fill) fprintf(f, "fill=\"%s\" ", color_str);
-            else fprintf(f, "fill=\"none\" ");
+            if (node->fill_rule == PLUTOVG_FILL_RULE_EVEN_ODD) {
+                fprintf(f, "fill-rule=\"evenodd\" ");
+            } else {
+                fprintf(f, "fill-rule=\"nonzero\" ");
+            }
+
+            if (node->has_fill) {
+                fprintf(f, "fill=\"#%02X%02X%02X\" ",
+                        (int)(node->fill_color.r * 255.0f + 0.5f),
+                        (int)(node->fill_color.g * 255.0f + 0.5f),
+                        (int)(node->fill_color.b * 255.0f + 0.5f));
+            } else {
+                fprintf(f, "fill=\"none\" ");
+            }
 
             if (node->has_stroke) {
-                fprintf(f, "stroke=\"#%02X%02X%02X\" stroke-width=\"%.4f\" ",
+                fprintf(f, "stroke=\"#%02X%02X%02X\" stroke-width=\"%g\" ",
                         (int)(node->stroke_color.r * 255.0f + 0.5f),
                         (int)(node->stroke_color.g * 255.0f + 0.5f),
                         (int)(node->stroke_color.b * 255.0f + 0.5f),
                         node->stroke_width);
+                if (node->stroke_join == PLUTOVG_LINE_JOIN_BEVEL) fprintf(f, "stroke-linejoin=\"bevel\" ");
+                else if (node->stroke_join == PLUTOVG_LINE_JOIN_ROUND) fprintf(f, "stroke-linejoin=\"round\" ");
+                if (node->stroke_cap == PLUTOVG_LINE_CAP_ROUND) fprintf(f, "stroke-linecap=\"round\" ");
+                else if (node->stroke_cap == PLUTOVG_LINE_CAP_SQUARE) fprintf(f, "stroke-linecap=\"square\" ");
             }
             fprintf(f, "d=\"%s\"/>\n", psb.data);
 
         } else if (node->type == SVG_NODE_TEXT) {
             plutovg_font_face_t* face = registry_find_font(&app->registry, node->font_family);
             if (face) {
-                // Generate glyph vector path in PlutoVG canvas
                 plutovg_canvas_save(temp_canvas);
                 plutovg_canvas_new_path(temp_canvas);
                 plutovg_canvas_set_font_face(temp_canvas, face);
@@ -823,9 +866,17 @@ static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) 
                 if (text_path) {
                     plutovg_path_traverse(text_path, svg_path_traverse_cb, &psb);
 
-                    fprintf(f, "  <path transform=\"matrix(%.6f,%.6f,%.6f,%.6f,%.6f,%.6f)\" fill=\"%s\" fill-rule=\"nonzero\" d=\"%s\"/>\n",
+                    char fill_str[32] = "#000000";
+                    if (node->has_fill) {
+                        snprintf(fill_str, sizeof(fill_str), "#%02X%02X%02X",
+                                 (int)(node->fill_color.r * 255.0f + 0.5f),
+                                 (int)(node->fill_color.g * 255.0f + 0.5f),
+                                 (int)(node->fill_color.b * 255.0f + 0.5f));
+                    }
+
+                    fprintf(f, "  <path transform=\"matrix(%g,%g,%g,%g,%g,%g)\" fill=\"%s\" fill-rule=\"nonzero\" d=\"%s\"/>\n",
                             node->matrix.a, node->matrix.b, node->matrix.c, node->matrix.d, node->matrix.e, node->matrix.f,
-                            color_str, psb.data);
+                            fill_str, psb.data);
                 }
                 plutovg_canvas_restore(temp_canvas);
             }
@@ -950,6 +1001,9 @@ static void render(AppState* app) {
             plutovg_canvas_transform(app->canvas, &node->matrix);
 
             if (node->type == SVG_NODE_PATH && node->path) {
+                // Apply winding rule (crucial for hollow glyphs like R, 8, B, O)
+                plutovg_canvas_set_fill_rule(app->canvas, node->fill_rule);
+
                 if (node->has_fill) {
                     plutovg_canvas_set_color(app->canvas, &node->fill_color);
                     plutovg_canvas_fill_path(app->canvas, node->path);
@@ -1101,7 +1155,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
-    // Keyboard handling: Arrow key panning (Feature A) and shortcuts
     case WM_KEYDOWN: {
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -1312,7 +1365,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // 1. Register Main Window Class
+    // 1. Main Window Class
     WNDCLASSEXA wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXA);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1322,7 +1375,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.lpszClassName = "PlutoVGViewerWindowClass";
     if (!RegisterClassExA(&wc)) return 1;
 
-    // 2. Register Modeless Log Window Class
+    // 2. Modeless Log Window Class
     WNDCLASSEXA log_wc = {0};
     log_wc.cbSize = sizeof(WNDCLASSEXA);
     log_wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1385,7 +1438,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     create_app_menu(g_app.hwnd_main);
 
-    // 5. Create Accelerator Table for Shortcuts
+    // 5. Accelerator Table
     ACCEL accels[] = {
         { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
         { FCONTROL | FVIRTKEY, 'E', ID_MENU_EXPORT_SVG },
@@ -1419,7 +1472,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         InvalidateRect(g_app.hwnd_main, NULL, FALSE);
     }
 
-    // 7. Message Loop with Accelerators
+    // 7. Message Loop
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0)) {
         if (!TranslateAcceleratorA(g_app.hwnd_main, hAccel, &msg)) {
