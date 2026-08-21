@@ -15,12 +15,13 @@
 
 #define ID_MENU_OPEN_SVG     1001
 #define ID_MENU_OPEN_FONT    1002
-#define ID_MENU_RESET_VIEW   1003
-#define ID_MENU_TOGGLE_GRID  1004
-#define ID_MENU_TOGGLE_LOG   1005
-#define ID_MENU_ZOOM_IN      1006
-#define ID_MENU_ZOOM_OUT     1007
-#define ID_MENU_EXIT         1008
+#define ID_MENU_EXPORT_SVG   1003
+#define ID_MENU_RESET_VIEW   1004
+#define ID_MENU_TOGGLE_GRID  1005
+#define ID_MENU_TOGGLE_LOG   1006
+#define ID_MENU_ZOOM_IN      1007
+#define ID_MENU_ZOOM_OUT     1008
+#define ID_MENU_EXIT         1009
 
 #define IDC_LOG_EDIT         2001
 #define MAX_FONTS            64
@@ -112,6 +113,41 @@ typedef struct {
 
 static AppState g_app;
 
+// --- Dynamic Buffer for Path Serialization ---
+typedef struct {
+    char* data;
+    size_t size;
+    size_t capacity;
+} PathStringBuffer;
+
+static void psb_init(PathStringBuffer* b, size_t initial_cap) {
+    b->capacity = initial_cap ? initial_cap : 4096;
+    b->size = 0;
+    b->data = (char*)malloc(b->capacity);
+    if (b->data) b->data[0] = '\0';
+}
+
+static void psb_append(PathStringBuffer* b, const char* str) {
+    if (!str || !b->data) return;
+    size_t len = strlen(str);
+    while (b->size + len + 1 > b->capacity) {
+        b->capacity *= 2;
+        b->data = (char*)realloc(b->data, b->capacity);
+    }
+    memcpy(b->data + b->size, str, len);
+    b->size += len;
+    b->data[b->size] = '\0';
+}
+
+static void psb_free(PathStringBuffer* b) {
+    if (b->data) {
+        free(b->data);
+        b->data = NULL;
+    }
+    b->size = 0;
+    b->capacity = 0;
+}
+
 // --- Non-Modal Logging Window Helper Functions ---
 
 static void log_clear(void) {
@@ -145,7 +181,7 @@ static void toggle_log_window(void) {
     CheckMenuItem(GetMenu(g_app.hwnd_main), ID_MENU_TOGGLE_LOG, !is_visible ? MF_CHECKED : MF_UNCHECKED);
 }
 
-// --- UTF-8 Encoding and Unicode Entity Decoder (Problem A) ---
+// --- UTF-8 Encoding & Unicode Entity Decoder ---
 
 static void append_utf8_codepoint(char* dst, size_t dst_max, size_t* d, uint32_t cp) {
     if (cp <= 0x7F) {
@@ -177,7 +213,6 @@ static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, s
         return 0;
     }
 
-    // Step 1: Strip XML tags and filter out raw control characters
     char no_tags[1024];
     size_t nt_len = 0;
     bool in_tag = false;
@@ -189,47 +224,38 @@ static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, s
             in_tag = false;
         } else if (!in_tag) {
             char c = src[i];
-            if (c == '\r' || c == '\n' || c == '\t') {
-                c = ' ';
-            }
+            if (c == '\r' || c == '\n' || c == '\t') c = ' ';
             no_tags[nt_len++] = c;
         }
     }
     no_tags[nt_len] = '\0';
 
-    // Step 2: Trim leading & trailing whitespace
     const char* start = no_tags;
-    while (nt_len > 0 && isspace((unsigned char)*start)) {
-        start++;
-        nt_len--;
-    }
-    while (nt_len > 0 && isspace((unsigned char)*(start + nt_len - 1))) {
-        nt_len--;
-    }
+    while (nt_len > 0 && isspace((unsigned char)*start)) { start++; nt_len--; }
+    while (nt_len > 0 && isspace((unsigned char)*(start + nt_len - 1))) { nt_len--; }
 
     if (nt_len == 0) {
         dst[0] = '\0';
         return 0;
     }
 
-    // Step 3: Precise Entity Decoding to valid UTF-8
     size_t d = 0;
     for (size_t i = 0; i < nt_len && d < dst_max - 1; ) {
         if (start[i] == '&') {
             if (strncmp(start + i, "&quot;", 6) == 0) {
-                append_utf8_codepoint(dst, dst_max, &d, 0x22); // ASCII 34
+                append_utf8_codepoint(dst, dst_max, &d, 0x22);
                 i += 6;
             } else if (strncmp(start + i, "&amp;", 5) == 0) {
-                append_utf8_codepoint(dst, dst_max, &d, 0x26); // ASCII 38
+                append_utf8_codepoint(dst, dst_max, &d, 0x26);
                 i += 5;
             } else if (strncmp(start + i, "&apos;", 6) == 0) {
-                append_utf8_codepoint(dst, dst_max, &d, 0x27); // ASCII 39
+                append_utf8_codepoint(dst, dst_max, &d, 0x27);
                 i += 6;
             } else if (strncmp(start + i, "&lt;", 4) == 0) {
-                append_utf8_codepoint(dst, dst_max, &d, 0x3C); // ASCII 60
+                append_utf8_codepoint(dst, dst_max, &d, 0x3C);
                 i += 4;
             } else if (strncmp(start + i, "&gt;", 4) == 0) {
-                append_utf8_codepoint(dst, dst_max, &d, 0x3E); // ASCII 62
+                append_utf8_codepoint(dst, dst_max, &d, 0x3E);
                 i += 4;
             } else if (strncmp(start + i, "&#x", 3) == 0 || strncmp(start + i, "&#X", 3) == 0) {
                 char* end = NULL;
@@ -293,9 +319,7 @@ static void registry_add_font(FontRegistry* reg, const char* name_key, const cha
     sanitize_key(name_key, clean_key, sizeof(clean_key));
 
     for (int i = 0; i < reg->count; ++i) {
-        if (strcmp(reg->fonts[i].key, clean_key) == 0) {
-            return;
-        }
+        if (strcmp(reg->fonts[i].key, clean_key) == 0) return;
     }
 
     plutovg_font_face_t* face = plutovg_font_face_load_from_file(path, 0);
@@ -320,9 +344,7 @@ static plutovg_font_face_t* registry_find_font(FontRegistry* reg, const char* fa
     sanitize_key(family_name, clean_key, sizeof(clean_key));
 
     for (int i = 0; i < reg->count; ++i) {
-        if (strcmp(reg->fonts[i].key, clean_key) == 0) {
-            return reg->fonts[i].face;
-        }
+        if (strcmp(reg->fonts[i].key, clean_key) == 0) return reg->fonts[i].face;
     }
 
     for (int i = 0; i < reg->count; ++i) {
@@ -370,7 +392,6 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
         }
     }
 
-    // System fallback
     if (!app->registry.fallback_face) {
         FontInfo sys_font;
         if (FontHelper_GetSystemFont(&sys_font)) {
@@ -388,9 +409,7 @@ static bool extract_attr(const char* tag_start, const char* attr_name, char* out
 
     const char* p = strstr(tag_start, search1);
     if (!p) p = strstr(tag_start, search2);
-    if (!p) {
-        if (strncmp(tag_start, attr_name, strlen(attr_name)) == 0) p = tag_start;
-    }
+    if (!p && strncmp(tag_start, attr_name, strlen(attr_name)) == 0) p = tag_start;
     if (!p) return false;
 
     p = strchr(p, '=');
@@ -713,6 +732,117 @@ static void load_svg_file(AppState* app, const char* path) {
     reset_view(app);
 }
 
+// --- Path Traversal Callback for SVG Export (Feature B) ---
+static void svg_path_traverse_cb(void* closure, plutovg_path_command_t command, const plutovg_point_t* points, int npoints) {
+    (void)npoints;
+    PathStringBuffer* psb = (PathStringBuffer*)closure;
+    char temp[128];
+
+    switch (command) {
+    case PLUTOVG_PATH_COMMAND_MOVE_TO:
+        snprintf(temp, sizeof(temp), "M%.4f %.4f ", points[0].x, points[0].y);
+        psb_append(psb, temp);
+        break;
+    case PLUTOVG_PATH_COMMAND_LINE_TO:
+        snprintf(temp, sizeof(temp), "L%.4f %.4f ", points[0].x, points[0].y);
+        psb_append(psb, temp);
+        break;
+    case PLUTOVG_PATH_COMMAND_CUBIC_TO:
+        snprintf(temp, sizeof(temp), "C%.4f %.4f %.4f %.4f %.4f %.4f ",
+                 points[0].x, points[0].y, points[1].x, points[1].y, points[2].x, points[2].y);
+        psb_append(psb, temp);
+        break;
+    case PLUTOVG_PATH_COMMAND_CLOSE:
+        psb_append(psb, "Z ");
+        break;
+    }
+}
+
+// --- Export SVG with Glyphs Converted to Vector Paths (Feature B) ---
+static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) {
+    if (!app->has_svg_loaded) return false;
+
+    FILE* f = fopen(out_path, "wb");
+    if (!f) return false;
+
+    fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.2f\" height=\"%.2f\" viewBox=\"0 0 %.2f %.2f\">\n",
+            app->svg.width, app->svg.height, app->svg.width, app->svg.height);
+
+    log_append("[EXPORT] Converting %d elements (with font glyphs -> vector paths)...", app->svg.node_count);
+
+    // Create a temporary canvas to generate text glyph contours
+    plutovg_surface_t* temp_surf = plutovg_surface_create(1, 1);
+    plutovg_canvas_t* temp_canvas = plutovg_canvas_create(temp_surf);
+
+    PathStringBuffer psb;
+    psb_init(&psb, 8192);
+
+    for (int i = 0; i < app->svg.node_count; ++i) {
+        SvgNode* node = &app->svg.nodes[i];
+        psb.size = 0;
+        if (psb.data) psb.data[0] = '\0';
+
+        char color_str[32] = "#000000";
+        if (node->has_fill) {
+            snprintf(color_str, sizeof(color_str), "#%02X%02X%02X",
+                     (int)(node->fill_color.r * 255.0f + 0.5f),
+                     (int)(node->fill_color.g * 255.0f + 0.5f),
+                     (int)(node->fill_color.b * 255.0f + 0.5f));
+        }
+
+        if (node->type == SVG_NODE_PATH && node->path) {
+            plutovg_path_traverse(node->path, svg_path_traverse_cb, &psb);
+
+            fprintf(f, "  <path transform=\"matrix(%.6f,%.6f,%.6f,%.6f,%.6f,%.6f)\" ",
+                    node->matrix.a, node->matrix.b, node->matrix.c, node->matrix.d, node->matrix.e, node->matrix.f);
+
+            if (node->has_fill) fprintf(f, "fill=\"%s\" ", color_str);
+            else fprintf(f, "fill=\"none\" ");
+
+            if (node->has_stroke) {
+                fprintf(f, "stroke=\"#%02X%02X%02X\" stroke-width=\"%.4f\" ",
+                        (int)(node->stroke_color.r * 255.0f + 0.5f),
+                        (int)(node->stroke_color.g * 255.0f + 0.5f),
+                        (int)(node->stroke_color.b * 255.0f + 0.5f),
+                        node->stroke_width);
+            }
+            fprintf(f, "d=\"%s\"/>\n", psb.data);
+
+        } else if (node->type == SVG_NODE_TEXT) {
+            plutovg_font_face_t* face = registry_find_font(&app->registry, node->font_family);
+            if (face) {
+                // Generate glyph vector path in PlutoVG canvas
+                plutovg_canvas_save(temp_canvas);
+                plutovg_canvas_new_path(temp_canvas);
+                plutovg_canvas_set_font_face(temp_canvas, face);
+                plutovg_canvas_set_font_size(temp_canvas, node->font_size);
+                plutovg_canvas_add_text(temp_canvas, node->text, node->text_len, PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
+
+                const plutovg_path_t* text_path = plutovg_canvas_get_path(temp_canvas);
+                if (text_path) {
+                    plutovg_path_traverse(text_path, svg_path_traverse_cb, &psb);
+
+                    fprintf(f, "  <path transform=\"matrix(%.6f,%.6f,%.6f,%.6f,%.6f,%.6f)\" fill=\"%s\" fill-rule=\"nonzero\" d=\"%s\"/>\n",
+                            node->matrix.a, node->matrix.b, node->matrix.c, node->matrix.d, node->matrix.e, node->matrix.f,
+                            color_str, psb.data);
+                }
+                plutovg_canvas_restore(temp_canvas);
+            }
+        }
+    }
+
+    fprintf(f, "</svg>\n");
+    fclose(f);
+
+    psb_free(&psb);
+    plutovg_canvas_destroy(temp_canvas);
+    plutovg_surface_destroy(temp_surf);
+
+    log_append("[EXPORT] Successfully exported standalone SVG with glyph paths to: %s", out_path);
+    return true;
+}
+
 static void resize_surface(AppState* app, int width, int height) {
     if (width <= 0 || height <= 0) return;
     if (app->canvas) plutovg_canvas_destroy(app->canvas);
@@ -724,11 +854,11 @@ static void resize_surface(AppState* app, int width, int height) {
     app->canvas = plutovg_canvas_create(app->surface);
 }
 
-// --- Red/Green Origin Marker & Grid (Problem B) ---
+// --- Red/Green Origin Marker & Grid ---
 static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_save(canvas);
 
-    // 1. Subtle Background Grid Lines
+    // 1. Grid
     plutovg_canvas_set_rgb(canvas, 0.18f, 0.20f, 0.23f);
     plutovg_canvas_set_line_width(canvas, 1.0f);
 
@@ -745,23 +875,20 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     }
     plutovg_canvas_stroke(canvas);
 
-    // 2. Continuous Major Coordinate Axes
-    // X-Axis (Red)
+    // 2. X-Axis (Red) & Y-Axis (Green)
     plutovg_canvas_set_rgb(canvas, 0.85f, 0.25f, 0.25f);
     plutovg_canvas_set_line_width(canvas, 2.0f);
     plutovg_canvas_move_to(canvas, -extent, 0.0f);
     plutovg_canvas_line_to(canvas, extent, 0.0f);
     plutovg_canvas_stroke(canvas);
 
-    // Y-Axis (Green)
     plutovg_canvas_set_rgb(canvas, 0.25f, 0.85f, 0.35f);
     plutovg_canvas_set_line_width(canvas, 2.0f);
     plutovg_canvas_move_to(canvas, 0.0f, -extent);
     plutovg_canvas_line_to(canvas, 0.0f, extent);
     plutovg_canvas_stroke(canvas);
 
-    // 3. Directional Origin Indicators at (0,0)
-    // +X Arrow (Red)
+    // 3. Directional Arrows
     plutovg_canvas_set_rgb(canvas, 1.0f, 0.3f, 0.3f);
     plutovg_canvas_set_line_width(canvas, 3.0f);
     plutovg_canvas_move_to(canvas, 0.0f, 0.0f);
@@ -771,7 +898,6 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_line_to(canvas, 37.0f, 5.0f);
     plutovg_canvas_stroke(canvas);
 
-    // +Y Arrow (Green)
     plutovg_canvas_set_rgb(canvas, 0.3f, 1.0f, 0.4f);
     plutovg_canvas_set_line_width(canvas, 3.0f);
     plutovg_canvas_move_to(canvas, 0.0f, 0.0f);
@@ -781,7 +907,7 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_line_to(canvas, 5.0f, 37.0f);
     plutovg_canvas_stroke(canvas);
 
-    // Center Origin Yellow Dot
+    // Center Origin Dot
     plutovg_canvas_set_rgb(canvas, 1.0f, 0.85f, 0.2f);
     plutovg_canvas_arc(canvas, 0.0f, 0.0f, 3.5f, 0.0f, 6.2831853f, 0);
     plutovg_canvas_fill(canvas);
@@ -792,14 +918,12 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
 static void render(AppState* app) {
     if (!app->canvas) return;
 
-    // Viewport background
     plutovg_canvas_save(app->canvas);
     plutovg_canvas_reset_matrix(app->canvas);
     plutovg_canvas_set_rgb(app->canvas, 0.12f, 0.13f, 0.15f);
     plutovg_canvas_fill_rect(app->canvas, 0, 0, (float)app->width, (float)app->height);
     plutovg_canvas_restore(app->canvas);
 
-    // Viewport transformations
     plutovg_canvas_save(app->canvas);
     plutovg_canvas_translate(app->canvas, app->pan_x, app->pan_y);
     plutovg_canvas_scale(app->canvas, app->zoom, app->zoom);
@@ -813,9 +937,7 @@ static void render(AppState* app) {
 
     if (app->show_grid) draw_grid_and_origin(app->canvas);
 
-    // Render SVG Elements
     if (app->has_svg_loaded) {
-        // White canvas background
         plutovg_canvas_save(app->canvas);
         plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
         plutovg_canvas_fill_rect(app->canvas, 0, 0, app->svg.width, app->svg.height);
@@ -846,7 +968,6 @@ static void render(AppState* app) {
                     plutovg_canvas_set_font_size(app->canvas, node->font_size);
                     plutovg_canvas_set_color(app->canvas, &node->fill_color);
 
-                    // Fully decoded UTF-8 representation
                     plutovg_canvas_fill_text(app->canvas, node->text, node->text_len,
                                             PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
                 }
@@ -869,7 +990,7 @@ static void zoom_at(AppState* app, float sx, float sy, float factor) {
     app->zoom = new_zoom;
 }
 
-static bool browse_file(HWND parent, const char* filter, char* out_path, size_t max_len) {
+static bool browse_file(HWND parent, const char* filter, char* out_path, size_t max_len, bool is_save) {
     OPENFILENAMEA ofn = {0};
     char buf[MAX_PATH] = {0};
     ofn.lStructSize = sizeof(OPENFILENAMEA);
@@ -877,11 +998,21 @@ static bool browse_file(HWND parent, const char* filter, char* out_path, size_t 
     ofn.lpstrFilter = filter;
     ofn.lpstrFile = buf;
     ofn.nMaxFile = sizeof(buf);
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.Flags = OFN_NOCHANGEDIR;
 
-    if (GetOpenFileNameA(&ofn)) {
-        strncpy(out_path, buf, max_len - 1);
-        return true;
+    if (is_save) {
+        ofn.Flags |= OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        ofn.lpstrDefExt = "svg";
+        if (GetSaveFileNameA(&ofn)) {
+            strncpy(out_path, buf, max_len - 1);
+            return true;
+        }
+    } else {
+        ofn.Flags |= OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (GetOpenFileNameA(&ofn)) {
+            strncpy(out_path, buf, max_len - 1);
+            return true;
+        }
     }
     return false;
 }
@@ -970,18 +1101,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
-    // Explicit Keydown Handler as Fallback (Problem C)
+    // Keyboard handling: Arrow key panning (Feature A) and shortcuts
     case WM_KEYDOWN: {
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        float pan_step = shift ? 120.0f : 40.0f;
 
         switch (wParam) {
+        case VK_LEFT:
+            g_app.pan_x += pan_step;
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case VK_RIGHT:
+            g_app.pan_x -= pan_step;
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case VK_UP:
+            g_app.pan_y += pan_step;
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case VK_DOWN:
+            g_app.pan_y -= pan_step;
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case 'E':
+            if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_EXPORT_SVG, 0);
+            break;
         case 'O':
-            if (ctrl) {
-                SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_SVG, 0);
-            } else {
-                SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_FONT, 0);
-            }
+            if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_SVG, 0);
+            else SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_FONT, 0);
             break;
         case 'L':
             SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_LOG, 0);
@@ -1033,7 +1181,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (LOWORD(wParam)) {
         case ID_MENU_OPEN_SVG: {
             char path[MAX_PATH];
-            if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path))) {
+            if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path), false)) {
                 load_svg_file(&g_app, path);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -1041,9 +1189,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case ID_MENU_OPEN_FONT: {
             char path[MAX_PATH];
-            if (browse_file(hwnd, "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0", path, sizeof(path))) {
+            if (browse_file(hwnd, "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0", path, sizeof(path), false)) {
                 registry_add_font(&g_app.registry, PathFindFileNameA(path), path);
                 InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        }
+        case ID_MENU_EXPORT_SVG: {
+            if (!g_app.has_svg_loaded) {
+                MessageBoxA(hwnd, "Please load an SVG file first.", "Export SVG", MB_ICONINFORMATION);
+                break;
+            }
+            char path[MAX_PATH];
+            if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path), true)) {
+                export_svg_with_embedded_paths(&g_app, path);
             }
             break;
         }
@@ -1123,6 +1282,7 @@ static void create_app_menu(HWND hwnd) {
 
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_OPEN_SVG, "Open .&SVG...\t(Ctrl+O)");
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_OPEN_FONT, "Open &Font...\t(O)");
+    AppendMenuA(hFileMenu, MF_STRING, ID_MENU_EXPORT_SVG, "&Export SVG (Glyphs to Paths)...\t(Ctrl+E)");
     AppendMenuA(hFileMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_EXIT, "E&xit");
 
@@ -1140,7 +1300,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)hPrevInstance;
     (void)lpCmdLine;
 
-    // High-DPI Awareness
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
         typedef BOOL (WINAPI *SetProcessDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
@@ -1226,9 +1385,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     create_app_menu(g_app.hwnd_main);
 
-    // 5. Create Accelerator Table for Shortcuts (Problem C)
+    // 5. Create Accelerator Table for Shortcuts
     ACCEL accels[] = {
         { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
+        { FCONTROL | FVIRTKEY, 'E', ID_MENU_EXPORT_SVG },
         { FVIRTKEY, 'O', ID_MENU_OPEN_FONT },
         { FVIRTKEY, 'L', ID_MENU_TOGGLE_LOG },
         { FVIRTKEY, 'G', ID_MENU_TOGGLE_GRID },
@@ -1259,7 +1419,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         InvalidateRect(g_app.hwnd_main, NULL, FALSE);
     }
 
-    // 7. Standard Accelerator Message Loop
+    // 7. Message Loop with Accelerators
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0)) {
         if (!TranslateAcceleratorA(g_app.hwnd_main, hAccel, &msg)) {
