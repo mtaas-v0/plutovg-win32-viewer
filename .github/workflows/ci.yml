@@ -9,7 +9,7 @@ on:
 jobs:
   build-windows:
     name: Windows (${{ matrix.compiler }})
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +42,8 @@ jobs:
           cmake -B build
           -G "${{ matrix.cmake_generator }}"
           -DCMAKE_BUILD_TYPE=Release
+      #cmake -B build -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++"
+      #static build if bundler not working
 
       - name: Build
         run: cmake --build build --config Release
@@ -49,7 +51,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PlutoVGViewer-${{ matrix.compiler }}
+          name: PlutoVGViewer-${{ matrix.compiler }}-r${{ github.run_number }}
           path: |
             build/Release/PlutoVGViewer.exe
             build/PlutoVGViewer.exe
