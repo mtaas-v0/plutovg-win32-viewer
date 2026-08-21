@@ -3,6 +3,7 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,9 @@
 #define ID_MENU_RESET_VIEW   1003
 #define ID_MENU_TOGGLE_GRID  1004
 #define ID_MENU_TOGGLE_LOG   1005
-#define ID_MENU_EXIT         1006
+#define ID_MENU_ZOOM_IN      1006
+#define ID_MENU_ZOOM_OUT     1007
+#define ID_MENU_EXIT         1008
 
 #define IDC_LOG_EDIT         2001
 #define MAX_FONTS            64
@@ -25,7 +28,7 @@
 
 // --- Font Lookup Registry for SVG ---
 typedef struct {
-    char key[128]; // e.g. "cmmi10", "cmsy10", "cmr10"
+    char key[128]; // e.g. "cmmi10", "cmsy10", "cmr10", "arial"
     char file_path[MAX_PATH];
     plutovg_font_face_t* face;
 } CachedFont;
@@ -58,7 +61,7 @@ typedef struct {
     // Path payload
     plutovg_path_t* path;
 
-    // Text payload
+    // Text payload (UTF-8 encoded)
     char text[512];
     int text_len;
     char font_family[128];
@@ -142,10 +145,32 @@ static void toggle_log_window(void) {
     CheckMenuItem(GetMenu(g_app.hwnd_main), ID_MENU_TOGGLE_LOG, !is_visible ? MF_CHECKED : MF_UNCHECKED);
 }
 
-// --- XML Content Cleaning & Entity Unescaping ---
-// 1. Strips any nested XML tags (e.g. <tspan ...> and </tspan>) so tag names aren't rendered as glyphs.
-// 2. Normalizes tabs/newlines to prevent random math symbols.
-// 3. Unescapes standard entities (&quot; -> byte 34 / epsilon in cmmi10).
+// --- UTF-8 Encoding and Unicode Entity Decoder (Problem A) ---
+
+static void append_utf8_codepoint(char* dst, size_t dst_max, size_t* d, uint32_t cp) {
+    if (cp <= 0x7F) {
+        if (*d < dst_max - 1) dst[(*d)++] = (char)cp;
+    } else if (cp <= 0x7FF) {
+        if (*d + 2 <= dst_max - 1) {
+            dst[(*d)++] = (char)(0xC0 | ((cp >> 6) & 0x1F));
+            dst[(*d)++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp <= 0xFFFF) {
+        if (*d + 3 <= dst_max - 1) {
+            dst[(*d)++] = (char)(0xE0 | ((cp >> 12) & 0x0F));
+            dst[(*d)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[(*d)++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp <= 0x10FFFF) {
+        if (*d + 4 <= dst_max - 1) {
+            dst[(*d)++] = (char)(0xF0 | ((cp >> 18) & 0x07));
+            dst[(*d)++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            dst[(*d)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[(*d)++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+}
+
 static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, size_t dst_max) {
     if (!src || src_len == 0 || dst_max == 0) {
         if (dst_max > 0) dst[0] = '\0';
@@ -187,39 +212,39 @@ static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, s
         return 0;
     }
 
-    // Step 3: Precise Entity Decoding
+    // Step 3: Precise Entity Decoding to valid UTF-8
     size_t d = 0;
     for (size_t i = 0; i < nt_len && d < dst_max - 1; ) {
         if (start[i] == '&') {
             if (strncmp(start + i, "&quot;", 6) == 0) {
-                dst[d++] = '\"'; // ASCII 34 (0x22)
+                append_utf8_codepoint(dst, dst_max, &d, 0x22); // ASCII 34
                 i += 6;
             } else if (strncmp(start + i, "&amp;", 5) == 0) {
-                dst[d++] = '&';  // ASCII 38
+                append_utf8_codepoint(dst, dst_max, &d, 0x26); // ASCII 38
                 i += 5;
             } else if (strncmp(start + i, "&apos;", 6) == 0) {
-                dst[d++] = '\''; // ASCII 39
+                append_utf8_codepoint(dst, dst_max, &d, 0x27); // ASCII 39
                 i += 6;
             } else if (strncmp(start + i, "&lt;", 4) == 0) {
-                dst[d++] = '<';  // ASCII 60
+                append_utf8_codepoint(dst, dst_max, &d, 0x3C); // ASCII 60
                 i += 4;
             } else if (strncmp(start + i, "&gt;", 4) == 0) {
-                dst[d++] = '>';  // ASCII 62
+                append_utf8_codepoint(dst, dst_max, &d, 0x3E); // ASCII 62
                 i += 4;
             } else if (strncmp(start + i, "&#x", 3) == 0 || strncmp(start + i, "&#X", 3) == 0) {
                 char* end = NULL;
-                long val = strtol(start + i + 3, &end, 16);
+                unsigned long cp = strtoul(start + i + 3, &end, 16);
                 if (end && *end == ';') {
-                    dst[d++] = (char)(val & 0xFF);
+                    append_utf8_codepoint(dst, dst_max, &d, (uint32_t)cp);
                     i = (size_t)(end - start) + 1;
                 } else {
                     dst[d++] = start[i++];
                 }
             } else if (strncmp(start + i, "&#", 2) == 0) {
                 char* end = NULL;
-                long val = strtol(start + i + 2, &end, 10);
+                unsigned long cp = strtoul(start + i + 2, &end, 10);
                 if (end && *end == ';') {
-                    dst[d++] = (char)(val & 0xFF);
+                    append_utf8_codepoint(dst, dst_max, &d, (uint32_t)cp);
                     i = (size_t)(end - start) + 1;
                 } else {
                     dst[d++] = start[i++];
@@ -342,6 +367,14 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
                 } while (FindNextFileA(hFind, &fd));
                 FindClose(hFind);
             }
+        }
+    }
+
+    // System fallback
+    if (!app->registry.fallback_face) {
+        FontInfo sys_font;
+        if (FontHelper_GetSystemFont(&sys_font)) {
+            registry_add_font(&app->registry, "system_default", sys_font.font_path);
         }
     }
 }
@@ -620,19 +653,15 @@ static void parse_svg(AppState* app, const char* svg_path) {
                         plutovg_matrix_init_identity(&node->matrix);
                     }
 
-                    // Extract & Clean inner text (stripping <tspan> tags and unescaping &quot;)
                     const char* text_start = tag_end + 1;
                     size_t raw_len = (size_t)(close_tag - text_start);
                     node->text_len = clean_and_unescape_text(text_start, raw_len, node->text, sizeof(node->text));
 
                     if (node->text_len > 0) {
                         app->svg.text_count++;
-                        log_append("  [TEXT] family='%s', size=%.1f, len=%d, first_byte=0x%02X ('%c')",
-                                   node->font_family, node->font_size, node->text_len,
-                                   (unsigned char)node->text[0],
-                                   isprint((unsigned char)node->text[0]) ? node->text[0] : '?');
+                        log_append("  [TEXT] family='%s', size=%.1f, len=%d, text='%s'",
+                                   node->font_family, node->font_size, node->text_len, node->text);
                     } else {
-                        // Discard empty text node
                         app->svg.node_count--;
                     }
                 }
@@ -695,9 +724,12 @@ static void resize_surface(AppState* app, int width, int height) {
     app->canvas = plutovg_canvas_create(app->surface);
 }
 
-static void draw_grid(plutovg_canvas_t* canvas) {
+// --- Red/Green Origin Marker & Grid (Problem B) ---
+static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_save(canvas);
-    plutovg_canvas_set_rgb(canvas, 0.20f, 0.22f, 0.25f);
+
+    // 1. Subtle Background Grid Lines
+    plutovg_canvas_set_rgb(canvas, 0.18f, 0.20f, 0.23f);
     plutovg_canvas_set_line_width(canvas, 1.0f);
 
     const float step = 50.0f;
@@ -712,6 +744,48 @@ static void draw_grid(plutovg_canvas_t* canvas) {
         plutovg_canvas_line_to(canvas, extent, y);
     }
     plutovg_canvas_stroke(canvas);
+
+    // 2. Continuous Major Coordinate Axes
+    // X-Axis (Red)
+    plutovg_canvas_set_rgb(canvas, 0.85f, 0.25f, 0.25f);
+    plutovg_canvas_set_line_width(canvas, 2.0f);
+    plutovg_canvas_move_to(canvas, -extent, 0.0f);
+    plutovg_canvas_line_to(canvas, extent, 0.0f);
+    plutovg_canvas_stroke(canvas);
+
+    // Y-Axis (Green)
+    plutovg_canvas_set_rgb(canvas, 0.25f, 0.85f, 0.35f);
+    plutovg_canvas_set_line_width(canvas, 2.0f);
+    plutovg_canvas_move_to(canvas, 0.0f, -extent);
+    plutovg_canvas_line_to(canvas, 0.0f, extent);
+    plutovg_canvas_stroke(canvas);
+
+    // 3. Directional Origin Indicators at (0,0)
+    // +X Arrow (Red)
+    plutovg_canvas_set_rgb(canvas, 1.0f, 0.3f, 0.3f);
+    plutovg_canvas_set_line_width(canvas, 3.0f);
+    plutovg_canvas_move_to(canvas, 0.0f, 0.0f);
+    plutovg_canvas_line_to(canvas, 45.0f, 0.0f);
+    plutovg_canvas_line_to(canvas, 37.0f, -5.0f);
+    plutovg_canvas_move_to(canvas, 45.0f, 0.0f);
+    plutovg_canvas_line_to(canvas, 37.0f, 5.0f);
+    plutovg_canvas_stroke(canvas);
+
+    // +Y Arrow (Green)
+    plutovg_canvas_set_rgb(canvas, 0.3f, 1.0f, 0.4f);
+    plutovg_canvas_set_line_width(canvas, 3.0f);
+    plutovg_canvas_move_to(canvas, 0.0f, 0.0f);
+    plutovg_canvas_line_to(canvas, 0.0f, 45.0f);
+    plutovg_canvas_line_to(canvas, -5.0f, 37.0f);
+    plutovg_canvas_move_to(canvas, 0.0f, 45.0f);
+    plutovg_canvas_line_to(canvas, 5.0f, 37.0f);
+    plutovg_canvas_stroke(canvas);
+
+    // Center Origin Yellow Dot
+    plutovg_canvas_set_rgb(canvas, 1.0f, 0.85f, 0.2f);
+    plutovg_canvas_arc(canvas, 0.0f, 0.0f, 3.5f, 0.0f, 6.2831853f, 0);
+    plutovg_canvas_fill(canvas);
+
     plutovg_canvas_restore(canvas);
 }
 
@@ -737,7 +811,7 @@ static void render(AppState* app) {
         plutovg_canvas_transform(app->canvas, &sm);
     }
 
-    if (app->show_grid) draw_grid(app->canvas);
+    if (app->show_grid) draw_grid_and_origin(app->canvas);
 
     // Render SVG Elements
     if (app->has_svg_loaded) {
@@ -772,9 +846,9 @@ static void render(AppState* app) {
                     plutovg_canvas_set_font_size(app->canvas, node->font_size);
                     plutovg_canvas_set_color(app->canvas, &node->fill_color);
 
-                    // Latin-1 maps 1-byte character codes (0..255) to uninstalled font glyphs
+                    // Fully decoded UTF-8 representation
                     plutovg_canvas_fill_text(app->canvas, node->text, node->text_len,
-                                            PLUTOVG_TEXT_ENCODING_LATIN1, node->x, node->y);
+                                            PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
                 }
             }
 
@@ -823,7 +897,7 @@ static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
         CheckMenuItem(GetMenu(g_app.hwnd_main), ID_MENU_TOGGLE_LOG, MF_UNCHECKED);
-        return 0; // Hide rather than destroy
+        return 0;
     }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
@@ -896,41 +970,44 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    // Explicit Keydown Handler as Fallback (Problem C)
     case WM_KEYDOWN: {
+        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
         switch (wParam) {
+        case 'O':
+            if (ctrl) {
+                SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_SVG, 0);
+            } else {
+                SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_FONT, 0);
+            }
+            break;
         case 'L':
-            toggle_log_window();
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_LOG, 0);
             break;
-        case 'R': {
-            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            g_app.rotation_deg += shift ? -5.0f : 5.0f;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        }
-        case 'S': {
-            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            g_app.shear_x += shift ? -0.05f : 0.05f;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        }
-        case VK_OEM_PLUS:
-        case VK_ADD:
-            zoom_at(&g_app, (float)g_app.width / 2.0f, (float)g_app.height / 2.0f, 1.15f);
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case VK_OEM_MINUS:
-        case VK_SUBTRACT:
-            zoom_at(&g_app, (float)g_app.width / 2.0f, (float)g_app.height / 2.0f, 1.0f / 1.15f);
-            InvalidateRect(hwnd, NULL, FALSE);
+        case 'G':
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_GRID, 0);
             break;
         case VK_SPACE:
         case '0':
-            reset_view(&g_app);
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_RESET_VIEW, 0);
+            break;
+        case 'R':
+            g_app.rotation_deg += shift ? -5.0f : 5.0f;
             InvalidateRect(hwnd, NULL, FALSE);
             break;
-        case 'G':
-            g_app.show_grid = !g_app.show_grid;
+        case 'S':
+            g_app.shear_x += shift ? -0.05f : 0.05f;
             InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case VK_OEM_PLUS:
+        case VK_ADD:
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_ZOOM_IN, 0);
+            break;
+        case VK_OEM_MINUS:
+        case VK_SUBTRACT:
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_ZOOM_OUT, 0);
             break;
         }
         return 0;
@@ -980,6 +1057,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case ID_MENU_TOGGLE_LOG:
             toggle_log_window();
+            break;
+        case ID_MENU_ZOOM_IN:
+            zoom_at(&g_app, (float)g_app.width / 2.0f, (float)g_app.height / 2.0f, 1.15f);
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case ID_MENU_ZOOM_OUT:
+            zoom_at(&g_app, (float)g_app.width / 2.0f, (float)g_app.height / 2.0f, 1.0f / 1.15f);
+            InvalidateRect(hwnd, NULL, FALSE);
             break;
         case ID_MENU_EXIT:
             DestroyWindow(hwnd);
@@ -1042,7 +1127,7 @@ static void create_app_menu(HWND hwnd) {
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_EXIT, "E&xit");
 
     AppendMenuA(hViewMenu, MF_STRING, ID_MENU_RESET_VIEW, "&Reset View\t(Space)");
-    AppendMenuA(hViewMenu, MF_STRING, ID_MENU_TOGGLE_GRID, "Toggle &Grid\t(G)");
+    AppendMenuA(hViewMenu, MF_STRING, ID_MENU_TOGGLE_GRID, "Toggle &Grid & Origin\t(G)");
     AppendMenuA(hViewMenu, MF_STRING | MF_UNCHECKED, ID_MENU_TOGGLE_LOG, "Show Debug &Log\t(L)");
 
     AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, "&File");
@@ -1140,10 +1225,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     create_app_menu(g_app.hwnd_main);
+
+    // 5. Create Accelerator Table for Shortcuts (Problem C)
+    ACCEL accels[] = {
+        { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
+        { FVIRTKEY, 'O', ID_MENU_OPEN_FONT },
+        { FVIRTKEY, 'L', ID_MENU_TOGGLE_LOG },
+        { FVIRTKEY, 'G', ID_MENU_TOGGLE_GRID },
+        { FVIRTKEY, VK_SPACE, ID_MENU_RESET_VIEW },
+        { FVIRTKEY, '0', ID_MENU_RESET_VIEW },
+        { FVIRTKEY, VK_OEM_PLUS, ID_MENU_ZOOM_IN },
+        { FVIRTKEY, VK_ADD, ID_MENU_ZOOM_IN },
+        { FVIRTKEY, VK_OEM_MINUS, ID_MENU_ZOOM_OUT },
+        { FVIRTKEY, VK_SUBTRACT, ID_MENU_ZOOM_OUT }
+    };
+    HACCEL hAccel = CreateAcceleratorTableA(accels, sizeof(accels) / sizeof(accels[0]));
+
     ShowWindow(g_app.hwnd_main, nCmdShow);
     UpdateWindow(g_app.hwnd_main);
 
-    // 5. Check Command Line Argument
+    // 6. Check Command Line Argument
     int argc = 0;
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argvW && argc > 1) {
@@ -1158,11 +1259,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         InvalidateRect(g_app.hwnd_main, NULL, FALSE);
     }
 
+    // 7. Standard Accelerator Message Loop
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        if (!TranslateAcceleratorA(g_app.hwnd_main, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
     }
 
+    if (hAccel) DestroyAcceleratorTable(hAccel);
     return (int)msg.wParam;
 }
