@@ -53,11 +53,20 @@ jobs:
         if: matrix.compiler == 'mingw'
         run: cmake --install build --prefix dist
 
-      - name: Upload Artifact
+      - name: Upload Artifact / MSVC
         uses: actions/upload-artifact@v4
+        if: matrix.compiler == 'msvc'
         with:
           name: PlutoVGViewer-${{ matrix.compiler }}-r${{ github.run_number }}
           path: |
             build/Release/PlutoVGViewer.exe
             build/PlutoVGViewer.exe
             
+      - name: Upload Artifact / MingW
+        uses: actions/upload-artifact@v4
+        if: matrix.compiler == 'mingw'
+        with:
+          name: PlutoVGViewer-${{ matrix.compiler }}-r${{ github.run_number }}
+          path: |
+            dist/
+      
