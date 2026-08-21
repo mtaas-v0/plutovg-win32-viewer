@@ -34,6 +34,7 @@ target_link_libraries(PlutoVGViewer PRIVATE
 
 if(MSVC)
     target_compile_options(PlutoVGViewer PRIVATE /W4)
+    target_link_options(PlutoVGViewer PRIVATE "/MANIFEST:NO")
 else()
     target_compile_options(PlutoVGViewer PRIVATE -Wall -Wextra)
 
