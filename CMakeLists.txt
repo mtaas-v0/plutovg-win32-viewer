@@ -51,10 +51,9 @@ else()
 
     # Ensure this block runs when deploying your executable target (e.g., "my_app")
     install(TARGETS PlutoVGViewer DESTINATION bin)
-    
+        
     # Fix: Force CMake to look into the MSYS2 environment directory at install time
     install(CODE [[
-        # Detect the MSYS2 MinGW/UCRT prefix from the current environment
         # Get the directory of the active MinGW compiler
         get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         
@@ -62,13 +61,20 @@ else()
             EXECUTABLES $<TARGET_FILE:PlutoVGViewer>
             RESOLVED_DEPENDENCIES_VAR _resolved_deps
             UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
-            DIRECTORIES "${MINGW_BIN_DIR}"  # <-- THIS ENABLES MSYS2 RESOLUTION
-            PRE_EXCLUDE_REGEXES "api-ms-*" "ext-ms-*"
-            POST_EXCLUDE_REGEXES ".*system32/.*\\.dll" ".*SYSTEM32/.*\\.dll" # Exclude standard Windows system DLLs
+            DIRECTORIES "${MINGW_BIN_DIR}"  # Enables MSYS2 resolution
+            
+            # OVERRIDE BUILT-IN FILTERS: Only exclude explicit Windows API layers here
+            PRE_EXCLUDE_REGEXES "^[Aa][Pp][Ii]-[Mm][Ss]-" "^[Ee][Xx][Tt]-[Mm][Ss]-"
+            
+            # Post-exclude standard system files but ALLOW MinGW/MSYS2 paths
+            POST_EXCLUDE_REGEXES 
+                "^[Cc]:/[Ww][Ii][Nn][Dd][Oo][Wws]/[Ss][Yy][Ss][Tt][Ee][Mm]32"
+                "^[Cc]:/[Ww][Ii][Nn][Dd][Oo][Wws]/[Ss][Yy][Ss][Ww][Oo][Ww]64"
         )
         
+        # Corrected install syntax loop
         foreach(_file ${_resolved_deps})
-            file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/bin" TYPE SHARED_LIBRARY FILES "${_file}")
+            file(INSTALL "${_file}" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
         endforeach()
     ]])
 
