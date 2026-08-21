@@ -55,7 +55,8 @@ else()
     # Fix: Force CMake to look into the MSYS2 environment directory at install time
     install(CODE [[
         # Detect the MSYS2 MinGW/UCRT prefix from the current environment
-        set(MINGW_BIN_DIR "$ENV{MINGW_PREFIX}/bin")
+        # Get the directory of the active MinGW compiler
+        get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         
         file(GET_RUNTIME_DEPENDENCIES
             EXECUTABLES $<TARGET_FILE:PlutoVGViewer>
