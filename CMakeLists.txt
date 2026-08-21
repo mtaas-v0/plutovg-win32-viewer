@@ -41,13 +41,20 @@ else()
     # Ensure this block runs when deploying your executable target (e.g., "my_app")
     install(TARGETS PlutoVGViewer DESTINATION bin)
     
-    # Dynamically resolve and copy libwinpthread, libgcc, etc.
+    # Fix: Force CMake to look into the MSYS2 environment directory at install time
     install(CODE [[
+        # Detect the MSYS2 MinGW/UCRT prefix from the current environment
+        set(MINGW_BIN_DIR "$ENV{MINGW_PREFIX}/bin")
+        
         file(GET_RUNTIME_DEPENDENCIES
             EXECUTABLES $<TARGET_FILE:PlutoVGViewer>
             RESOLVED_DEPENDENCIES_VAR _resolved_deps
             UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
+            DIRECTORIES "${MINGW_BIN_DIR}"  # <-- THIS ENABLES MSYS2 RESOLUTION
+            PRE_EXCLUDE_REGEXES "api-ms-*" "ext-ms-*"
+            POST_EXCLUDE_REGEXES ".*system32/.*\\.dll" ".*SYSTEM32/.*\\.dll" # Exclude standard Windows system DLLs
         )
+        
         foreach(_file ${_resolved_deps})
             file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/bin" TYPE SHARED_LIBRARY FILES "${_file}")
         endforeach()
