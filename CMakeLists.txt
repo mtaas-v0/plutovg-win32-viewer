@@ -17,7 +17,7 @@ FetchContent_Declare(
 FetchContent_Declare(
     plutosvg
     GIT_REPOSITORY https://github.com/sammycage/plutosvg.git
-    GIT_TAG main
+    GIT_TAG master
 )
 
 FetchContent_MakeAvailable(plutovg plutosvg)
