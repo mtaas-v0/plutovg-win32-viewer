@@ -1,0 +1,9 @@
+build/
+bin/
+.cache/
+.vs/
+*.user
+*.exe
+*.obj
+*.lib
+*.pdb

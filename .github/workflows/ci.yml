@@ -1,0 +1,56 @@
+name: CI Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-windows:
+    name: Windows (${{ matrix.compiler }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: msvc
+            cmake_generator: "Visual Studio 17 2022"
+          - compiler: mingw
+            cmake_generator: "MinGW Makefiles"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW
+        if: matrix.compiler == 'mingw'
+        uses: egor-trefilov/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: Configure (MSVC)
+        if: matrix.compiler == 'msvc'
+        run: >
+          cmake -B build
+          -G "${{ matrix.cmake_generator }}"
+          -A x64
+
+      - name: Configure (MinGW)
+        if: matrix.compiler == 'mingw'
+        run: >
+          cmake -B build
+          -G "${{ matrix.cmake_generator }}"
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlutoVGViewer-${{ matrix.compiler }}
+          path: |
+            build/Release/PlutoVGViewer.exe
+            build/PlutoVGViewer.exe
+            
