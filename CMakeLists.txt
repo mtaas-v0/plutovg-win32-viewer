@@ -48,34 +48,26 @@ if(MSVC)
     target_link_options(PlutoVGViewer PRIVATE "/MANIFEST:NO")
 else()
     target_compile_options(PlutoVGViewer PRIVATE -Wall -Wextra)
-
-    # Ensure this block runs when deploying your executable target (e.g., "my_app")
+)
     install(TARGETS PlutoVGViewer DESTINATION bin)
-        
-    # Fix: Force CMake to look into the MSYS2 environment directory at install time
-    install(CODE [[
+            
+    if(MINGW)
         # Get the directory of the active MinGW compiler
         get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         
-        file(GET_RUNTIME_DEPENDENCIES
-            EXECUTABLES $<TARGET_FILE:PlutoVGViewer>
-            RESOLVED_DEPENDENCIES_VAR _resolved_deps
-            UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
-            DIRECTORIES "${MINGW_BIN_DIR}"  # Enables MSYS2 resolution
-            
-            # OVERRIDE BUILT-IN FILTERS: Only exclude explicit Windows API layers here
-            PRE_EXCLUDE_REGEXES "^[Aa][Pp][Ii]-[Mm][Ss]-" "^[Ee][Xx][Tt]-[Mm][Ss]-"
-            
-            # Post-exclude standard system files but ALLOW MinGW/MSYS2 paths
-            POST_EXCLUDE_REGEXES 
-                "^[Cc]:/[Ww][Ii][Nn][Dd][Oo][Wws]/[Ss][Yy][Ss][Tt][Ee][Mm]32"
-                "^[Cc]:/[Ww][Ii][Nn][Dd][Oo][Wws]/[Ss][Yy][Ss][Ww][Oo][Ww]64"
+        # List the runtime DLLs you want to bundle
+        set(MINGW_RUNTIMES
+            "${MINGW_BIN_DIR}/libwinpthread-1.dll"
+            "${MINGW_BIN_DIR}/libgcc_s_seh-1.dll"
+            "${MINGW_BIN_DIR}/libstdc++-6.dll"
         )
-        
-        # Corrected install syntax loop
-        foreach(_file ${_resolved_deps})
-            file(INSTALL "${_file}" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
+    
+        # Copy them during the install phase
+        foreach(dll ${MINGW_RUNTIMES})
+            if(EXISTS "${dll}")
+                install(FILES "${dll}" DESTINATION bin)
+            endif()
         endforeach()
-    ]])
+    endif()
 
 endif()
