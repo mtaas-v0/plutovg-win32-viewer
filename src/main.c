@@ -13,23 +13,84 @@
 #include <plutovg.h>
 #include "font_helper.h"
 
-#define ID_MENU_OPEN_SVG     1001
-#define ID_MENU_OPEN_FONT    1002
-#define ID_MENU_EXPORT_SVG   1003
-#define ID_MENU_RESET_VIEW   1004
-#define ID_MENU_TOGGLE_GRID  1005
-#define ID_MENU_TOGGLE_LOG   1006
-#define ID_MENU_ZOOM_IN      1007
-#define ID_MENU_ZOOM_OUT     1008
-#define ID_MENU_EXIT         1009
+// Command IDs
+#define ID_MENU_OPEN_SVG      1001
+#define ID_MENU_OPEN_FONT     1002
+#define ID_MENU_SAVE_ANNOT    1003
+#define ID_MENU_SAVE_ANNOT_AS 1004
+#define ID_MENU_EXPORT_SVG    1005
+#define ID_MENU_EXIT          1006
 
-#define IDC_LOG_EDIT         2001
-#define MAX_FONTS            64
-#define MAX_SVG_NODES        8192
+#define ID_MENU_RESET_VIEW    1010
+#define ID_MENU_TOGGLE_GRID   1011
+#define ID_MENU_TOGGLE_LOG    1012
+#define ID_MENU_TOGGLE_MODE   1013
+#define ID_MENU_DELETE_ANNOT  1014
+#define ID_MENU_CLEAR_ANNOT   1015
+#define ID_MENU_CYCLE_CLASS   1016
+
+#define ID_MENU_CLASS_BASE    1100
+#define ID_MENU_ZOOM_IN       1201
+#define ID_MENU_ZOOM_OUT      1202
+
+#define IDC_LOG_EDIT          2001
+#define MAX_FONTS             64
+#define MAX_SVG_NODES         8192
+#define MAX_ANNOTATIONS       512
+#define MAX_CATEGORIES        8
+
+// --- Annotation Mode & Handles ---
+typedef enum {
+    APP_MODE_NAVIGATE, // Left drag = pan
+    APP_MODE_ANNOTATE  // Left drag = draw new bbox
+} AppInteractionMode;
+
+typedef enum {
+    HANDLE_NONE = 0,
+    HANDLE_BODY,
+    HANDLE_TOP_LEFT,
+    HANDLE_TOP_RIGHT,
+    HANDLE_BOTTOM_LEFT,
+    HANDLE_BOTTOM_RIGHT
+} ResizeHandle;
+
+// --- Category Palette ---
+typedef struct {
+    int id;
+    char name[32];
+    float r, g, b;
+} AnnotationCategory;
+
+static const AnnotationCategory DEFAULT_CATEGORIES[MAX_CATEGORIES] = {
+    { 0, "formula",  0.95f, 0.20f, 0.20f }, // Red
+    { 1, "symbol",   0.15f, 0.80f, 0.35f }, // Green
+    { 2, "text",     0.10f, 0.55f, 0.98f }, // Blue
+    { 3, "operator", 1.00f, 0.60f, 0.10f }, // Orange
+    { 4, "fraction", 0.70f, 0.30f, 0.90f }, // Purple
+    { 5, "matrix",   0.10f, 0.80f, 0.85f }, // Cyan
+    { 6, "script",   0.95f, 0.85f, 0.15f }, // Yellow
+    { 7, "diagram",  0.95f, 0.30f, 0.65f }  // Pink
+};
+
+// --- YOLO Annotation Structure ---
+typedef struct {
+    int id;
+    int class_id;
+    char class_name[32];
+    
+    // Normalized YOLO format [0..1]: [x_center, y_center, width, height]
+    float x_center;
+    float y_center;
+    float width;
+    float height;
+
+    // Computed absolute canvas coords [x, y, w, h]
+    float x, y, w, h;
+} YoloAnnotation;
 
 // --- Font Lookup Registry for SVG ---
 typedef struct {
-    char key[128]; // e.g. "cmmi10", "cmsy10", "cmr10", "arial"
+    char key[128];
     char file_path[MAX_PATH];
     plutovg_font_face_t* face;
 } CachedFont;
@@ -50,7 +111,6 @@ typedef struct {
     SvgNodeType type;
     plutovg_matrix_t matrix;
 
-    // Stroke & Fill & Winding Rule
     bool has_fill;
     plutovg_color_t fill_color;
     plutovg_fill_rule_t fill_rule;
@@ -60,10 +120,8 @@ typedef struct {
     plutovg_line_join_t stroke_join;
     plutovg_line_cap_t stroke_cap;
 
-    // Path payload
     plutovg_path_t* path;
 
-    // Text payload (UTF-8 encoded)
     char text[512];
     int text_len;
     char font_family[128];
@@ -88,24 +146,42 @@ typedef struct {
     HWND hwnd_log_edit;
     HFONT hfont_log;
 
+    // Viewport
     float zoom;
     float pan_x;
     float pan_y;
     float rotation_deg;
     float shear_x;
 
-    bool is_dragging;
+    // Drag / Interaction State
+    bool is_dragging_view;
+    bool is_drawing_box;
+    bool is_transforming_box;
+    ResizeHandle active_handle;
     POINT last_mouse;
+    float drag_start_canvas_x;
+    float drag_start_canvas_y;
+    float drag_curr_canvas_x;
+    float drag_curr_canvas_y;
 
+    // Annotation Data
+    AppInteractionMode interaction_mode;
+    YoloAnnotation annotations[MAX_ANNOTATIONS];
+    int annotation_count;
+    int selected_annotation_idx;
+    int active_class_id;
+    char annot_file_path[MAX_PATH];
+
+    // Window buffer
     int width;
     int height;
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
 
+    // Document & Registry
     char current_svg_path[MAX_PATH];
     char current_svg_name[128];
     char fonts_dir[MAX_PATH];
-
     FontRegistry registry;
     SvgDocument svg;
     bool has_svg_loaded;
@@ -114,7 +190,7 @@ typedef struct {
 
 static AppState g_app;
 
-// --- Dynamic Buffer for Path Serialization ---
+// --- Path String Buffer ---
 typedef struct {
     char* data;
     size_t size;
@@ -141,25 +217,19 @@ static void psb_append(PathStringBuffer* b, const char* str) {
 }
 
 static void psb_free(PathStringBuffer* b) {
-    if (b->data) {
-        free(b->data);
-        b->data = NULL;
-    }
-    b->size = 0;
-    b->capacity = 0;
+    if (b->data) free(b->data);
+    b->data = NULL;
+    b->size = b->capacity = 0;
 }
 
 // --- Non-Modal Logging Window Helper Functions ---
 
 static void log_clear(void) {
-    if (g_app.hwnd_log_edit) {
-        SetWindowTextA(g_app.hwnd_log_edit, "");
-    }
+    if (g_app.hwnd_log_edit) SetWindowTextA(g_app.hwnd_log_edit, "");
 }
 
 static void log_append(const char* fmt, ...) {
     if (!g_app.hwnd_log_edit) return;
-
     char buffer[1024];
     va_list args;
     va_start(args, fmt);
@@ -176,13 +246,201 @@ static void toggle_log_window(void) {
     if (!g_app.hwnd_log) return;
     bool is_visible = IsWindowVisible(g_app.hwnd_log);
     ShowWindow(g_app.hwnd_log, is_visible ? SW_HIDE : SW_SHOW);
-    if (!is_visible) {
-        SetForegroundWindow(g_app.hwnd_log);
-    }
+    if (!is_visible) SetForegroundWindow(g_app.hwnd_log);
     CheckMenuItem(GetMenu(g_app.hwnd_main), ID_MENU_TOGGLE_LOG, !is_visible ? MF_CHECKED : MF_UNCHECKED);
 }
 
-// --- UTF-8 Encoding & Unicode Entity Decoder ---
+// --- Coordinate Conversions ---
+
+static void screen_to_canvas(AppState* app, float sx, float sy, float* cx, float* cy) {
+    float dx = (sx - app->pan_x) / app->zoom;
+    float dy = (sy - app->pan_y) / app->zoom;
+    float rad = -app->rotation_deg * (3.1415926535f / 180.0f);
+    *cx = dx * cosf(rad) - dy * sinf(rad);
+    *cy = dx * sinf(rad) + dy * cosf(rad);
+}
+
+static void update_annotation_pixels(AppState* app, YoloAnnotation* a) {
+    float sw = app->svg.width > 0 ? app->svg.width : 800.0f;
+    float sh = app->svg.height > 0 ? app->svg.height : 600.0f;
+
+    a->w = a->width * sw;
+    a->h = a->height * sh;
+    a->x = (a->x_center * sw) - (a->w / 2.0f);
+    a->y = (a->y_center * sh) - (a->h / 2.0f);
+}
+
+static void update_annotation_normalized(AppState* app, YoloAnnotation* a, float x, float y, float w, float h) {
+    float sw = app->svg.width > 0 ? app->svg.width : 800.0f;
+    float sh = app->svg.height > 0 ? app->svg.height : 600.0f;
+
+    if (w < 0) { x += w; w = -w; }
+    if (h < 0) { y += h; h = -h; }
+
+    a->x = x; a->y = y; a->w = w; a->h = h;
+    a->width = w / sw;
+    a->height = h / sh;
+    a->x_center = (x + w / 2.0f) / sw;
+    a->y_center = (y + h / 2.0f) / sh;
+}
+
+// --- YOLO YAML Serializer & Loader ---
+
+static void get_default_annot_path(const char* svg_path, char* out_yaml, size_t max_len) {
+    strncpy(out_yaml, svg_path, max_len - 1);
+    char* dot = strrchr(out_yaml, '.');
+    if (dot) *dot = '\0';
+    strncat(out_yaml, "-yoloAnnot.yaml", max_len - strlen(out_yaml) - 1);
+}
+
+static bool save_yolo_annotations(AppState* app, const char* yaml_path) {
+    if (!yaml_path || strlen(yaml_path) == 0) return false;
+
+    FILE* f = fopen(yaml_path, "w");
+    if (!f) {
+        log_append("[ANNOT] Error: Failed to open %s for writing.", yaml_path);
+        return false;
+    }
+
+    fprintf(f, "# YOLO Annotation File for %s\n", app->current_svg_name);
+    fprintf(f, "image: \"%s\"\n", app->current_svg_name);
+    fprintf(f, "image_width: %.2f\n", app->svg.width);
+    fprintf(f, "image_height: %.2f\n\n", app->svg.height);
+
+    fprintf(f, "categories:\n");
+    for (int i = 0; i < MAX_CATEGORIES; ++i) {
+        fprintf(f, "  - id: %d\n    name: \"%s\"\n", DEFAULT_CATEGORIES[i].id, DEFAULT_CATEGORIES[i].name);
+    }
+
+    fprintf(f, "\nannotations:\n");
+    for (int i = 0; i < app->annotation_count; ++i) {
+        YoloAnnotation* a = &app->annotations[i];
+        fprintf(f, "  - id: %d\n", i);
+        fprintf(f, "    class_id: %d\n", a->class_id);
+        fprintf(f, "    class_name: \"%s\"\n", a->class_name);
+        fprintf(f, "    # [x_center, y_center, width, height] (normalized)\n");
+        fprintf(f, "    bbox: [%.6f, %.6f, %.6f, %.6f]\n", a->x_center, a->y_center, a->width, a->height);
+        fprintf(f, "    # Absolute canvas pixels: [x, y, w, h]\n");
+        fprintf(f, "    rect: [%.2f, %.2f, %.2f, %.2f]\n\n", a->x, a->y, a->w, a->h);
+    }
+
+    fclose(f);
+    strncpy(app->annot_file_path, yaml_path, MAX_PATH - 1);
+    log_append("[ANNOT] Saved %d annotations to %s", app->annotation_count, yaml_path);
+    return true;
+}
+
+static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
+    if (!yaml_path || GetFileAttributesA(yaml_path) == INVALID_FILE_ATTRIBUTES) return false;
+
+    FILE* f = fopen(yaml_path, "r");
+    if (!f) return false;
+
+    app->annotation_count = 0;
+    app->selected_annotation_idx = -1;
+
+    char line[512];
+    YoloAnnotation current = {0};
+    bool in_annotation = false;
+
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+
+        if (*p == '#' || *p == '\0') continue;
+
+        if (strncmp(p, "- id:", 5) == 0) {
+            if (in_annotation && app->annotation_count < MAX_ANNOTATIONS) {
+                update_annotation_pixels(app, &current);
+                app->annotations[app->annotation_count++] = current;
+                memset(&current, 0, sizeof(YoloAnnotation));
+            }
+            in_annotation = true;
+            current.id = atoi(p + 5);
+        } else if (in_annotation) {
+            if (strncmp(p, "class_id:", 9) == 0) {
+                current.class_id = atoi(p + 9);
+                if (current.class_id >= 0 && current.class_id < MAX_CATEGORIES) {
+                    strncpy(current.class_name, DEFAULT_CATEGORIES[current.class_id].name, sizeof(current.class_name) - 1);
+                }
+            } else if (strncmp(p, "class_name:", 11) == 0) {
+                char* q1 = strchr(p, '\"');
+                char* q2 = q1 ? strchr(q1 + 1, '\"') : NULL;
+                if (q1 && q2) {
+                    size_t len = q2 - (q1 + 1);
+                    if (len < sizeof(current.class_name)) {
+                        strncpy(current.class_name, q1 + 1, len);
+                        current.class_name[len] = '\0';
+                    }
+                }
+            } else if (strncmp(p, "bbox:", 5) == 0) {
+                char* b_start = strchr(p, '[');
+                if (b_start) {
+                    sscanf(b_start, "[%f, %f, %f, %f]", 
+                           &current.x_center, &current.y_center, &current.width, &current.height);
+                }
+            }
+        }
+    }
+
+    if (in_annotation && app->annotation_count < MAX_ANNOTATIONS) {
+        update_annotation_pixels(app, &current);
+        app->annotations[app->annotation_count++] = current;
+    }
+
+    fclose(f);
+    strncpy(app->annot_file_path, yaml_path, MAX_PATH - 1);
+    log_append("[ANNOT] Auto-loaded %d annotations from %s", app->annotation_count, yaml_path);
+    return true;
+}
+
+// --- Hit Testing & Handles ---
+
+static ResizeHandle hit_test_handles(AppState* app, const YoloAnnotation* a, float cx, float cy) {
+    float handle_size = 12.0f / app->zoom;
+    float hs2 = handle_size / 2.0f;
+
+    // Check corners
+    if (cx >= a->x - hs2 && cx <= a->x + hs2 && cy >= a->y - hs2 && cy <= a->y + hs2)
+        return HANDLE_TOP_LEFT;
+    if (cx >= a->x + a->w - hs2 && cx <= a->x + a->w + hs2 && cy >= a->y - hs2 && cy <= a->y + hs2)
+        return HANDLE_TOP_RIGHT;
+    if (cx >= a->x - hs2 && cx <= a->x + hs2 && cy >= a->y + a->h - hs2 && cy <= a->y + a->h + hs2)
+        return HANDLE_BOTTOM_LEFT;
+    if (cx >= a->x + a->w - hs2 && cx <= a->x + a->w + hs2 && cy >= a->y + a->h - hs2 && cy <= a->y + a->h + hs2)
+        return HANDLE_BOTTOM_RIGHT;
+
+    // Check body
+    if (cx >= a->x && cx <= a->x + a->w && cy >= a->y && cy <= a->y + a->h)
+        return HANDLE_BODY;
+
+    return HANDLE_NONE;
+}
+
+static int hit_test_annotations(AppState* app, float cx, float cy, ResizeHandle* out_handle) {
+    // Check selected annotation first for handle priority
+    if (app->selected_annotation_idx >= 0 && app->selected_annotation_idx < app->annotation_count) {
+        ResizeHandle h = hit_test_handles(app, &app->annotations[app->selected_annotation_idx], cx, cy);
+        if (h != HANDLE_NONE) {
+            *out_handle = h;
+            return app->selected_annotation_idx;
+        }
+    }
+
+    // Check in reverse order (top to bottom)
+    for (int i = app->annotation_count - 1; i >= 0; --i) {
+        ResizeHandle h = hit_test_handles(app, &app->annotations[i], cx, cy);
+        if (h != HANDLE_NONE) {
+            *out_handle = h;
+            return i;
+        }
+    }
+
+    *out_handle = HANDLE_NONE;
+    return -1;
+}
+
+// --- UTF-8 & Entity Decoder ---
 
 static void append_utf8_codepoint(char* dst, size_t dst_max, size_t* d, uint32_t cp) {
     if (cp <= 0x7F) {
@@ -219,11 +477,9 @@ static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, s
     bool in_tag = false;
 
     for (size_t i = 0; i < src_len && nt_len < sizeof(no_tags) - 1; ++i) {
-        if (src[i] == '<') {
-            in_tag = true;
-        } else if (src[i] == '>') {
-            in_tag = false;
-        } else if (!in_tag) {
+        if (src[i] == '<') in_tag = true;
+        else if (src[i] == '>') in_tag = false;
+        else if (!in_tag) {
             char c = src[i];
             if (c == '\r' || c == '\n' || c == '\t') c = ' ';
             no_tags[nt_len++] = c;
@@ -264,24 +520,16 @@ static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, s
                 if (end && *end == ';') {
                     append_utf8_codepoint(dst, dst_max, &d, (uint32_t)cp);
                     i = (size_t)(end - start) + 1;
-                } else {
-                    dst[d++] = start[i++];
-                }
+                } else dst[d++] = start[i++];
             } else if (strncmp(start + i, "&#", 2) == 0) {
                 char* end = NULL;
                 unsigned long cp = strtoul(start + i + 2, &end, 10);
                 if (end && *end == ';') {
                     append_utf8_codepoint(dst, dst_max, &d, (uint32_t)cp);
                     i = (size_t)(end - start) + 1;
-                } else {
-                    dst[d++] = start[i++];
-                }
-            } else {
-                dst[d++] = start[i++];
-            }
-        } else {
-            dst[d++] = start[i++];
-        }
+                } else dst[d++] = start[i++];
+            } else dst[d++] = start[i++];
+        } else dst[d++] = start[i++];
     }
     dst[d] = '\0';
     return (int)d;
@@ -292,9 +540,7 @@ static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, s
 static void sanitize_key(const char* src, char* dst, size_t dst_len) {
     size_t j = 0;
     for (size_t i = 0; src[i] != '\0' && j < dst_len - 1; ++i) {
-        if (isalnum((unsigned char)src[i])) {
-            dst[j++] = (char)tolower((unsigned char)src[i]);
-        }
+        if (isalnum((unsigned char)src[i])) dst[j++] = (char)tolower((unsigned char)src[i]);
     }
     dst[j] = '\0';
 }
@@ -401,7 +647,7 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
     }
 }
 
-// --- Zero-Copy Attribute & Transform Locator (No buffer truncations) ---
+// --- Attribute Locator ---
 
 static const char* find_attr_slice(const char* tag_start, const char* tag_end, const char* attr_name, size_t* out_len) {
     if (!tag_start || !tag_end || tag_start >= tag_end || !attr_name) return NULL;
@@ -500,43 +746,26 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
                 }
                 p = rp + 1;
             } else { p++; }
-        } else {
-            p++;
-        }
+        } else p++;
     }
 }
 
 static void parse_color_slice(const char* val, size_t len, bool* has_paint, plutovg_color_t* color, plutovg_color_t default_color) {
-    if (!val || len == 0) {
-        *has_paint = false;
-        return;
-    }
-
+    if (!val || len == 0) { *has_paint = false; return; }
     char buf[64];
     if (len >= sizeof(buf)) len = sizeof(buf) - 1;
     strncpy(buf, val, len);
     buf[len] = '\0';
 
-    if (_stricmp(buf, "none") == 0) {
-        *has_paint = false;
-        return;
-    }
+    if (_stricmp(buf, "none") == 0) { *has_paint = false; return; }
     if (_stricmp(buf, "currentColor") == 0 || _stricmp(buf, "black") == 0) {
-        *has_paint = true;
-        plutovg_color_init_rgb(color, 0, 0, 0);
-        return;
+        *has_paint = true; plutovg_color_init_rgb(color, 0, 0, 0); return;
     }
     if (_stricmp(buf, "white") == 0) {
-        *has_paint = true;
-        plutovg_color_init_rgb(color, 1, 1, 1);
-        return;
+        *has_paint = true; plutovg_color_init_rgb(color, 1, 1, 1); return;
     }
-    if (plutovg_color_parse(color, buf, (int)len)) {
-        *has_paint = true;
-    } else {
-        *has_paint = true;
-        *color = default_color;
-    }
+    if (plutovg_color_parse(color, buf, (int)len)) *has_paint = true;
+    else { *has_paint = true; *color = default_color; }
 }
 
 static void free_svg_doc(SvgDocument* doc) {
@@ -558,7 +787,6 @@ static void parse_svg(AppState* app, const char* svg_path) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-
     if (size <= 0) { fclose(f); return; }
 
     char* buffer = (char*)malloc(size + 1);
@@ -597,7 +825,7 @@ static void parse_svg(AppState* app, const char* svg_path) {
             continue;
         }
 
-        // 1. Parse <path ... /> with ZERO truncation
+        // 1. <path ... />
         if (strncmp(tag_open, "<path", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
             if (!tag_end) { cur = tag_open + 5; continue; }
@@ -611,36 +839,26 @@ static void parse_svg(AppState* app, const char* svg_path) {
                 node->path = plutovg_path_create();
                 node->fill_rule = PLUTOVG_FILL_RULE_NON_ZERO;
 
-                // Parse path directly from XML memory slice
                 plutovg_path_parse(node->path, d_str, (int)d_len);
 
-                // Transform
                 size_t t_len = 0;
                 const char* t_str = find_attr_slice(tag_open, tag_end, "transform", &t_len);
-                if (t_str && t_len > 0) {
-                    parse_svg_transform(t_str, t_len, &node->matrix);
-                } else {
-                    plutovg_matrix_init_identity(&node->matrix);
-                }
+                if (t_str && t_len > 0) parse_svg_transform(t_str, t_len, &node->matrix);
+                else plutovg_matrix_init_identity(&node->matrix);
 
-                // Fill-rule
                 size_t fr_len = 0;
                 const char* fr_str = find_attr_slice(tag_open, tag_end, "fill-rule", &fr_len);
                 if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) {
                     node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
                 }
 
-                // Stroke defaults
                 node->stroke_width = 1.0f;
                 node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
                 node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
 
                 size_t a_len = 0;
                 const char* a_str = NULL;
-
-                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-width", &a_len))) {
-                    node->stroke_width = (float)atof(a_str);
-                }
+                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-width", &a_len))) node->stroke_width = (float)atof(a_str);
                 if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-linejoin", &a_len))) {
                     if (a_len >= 5 && strncmp(a_str, "bevel", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_BEVEL;
                     else if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_ROUND;
@@ -669,7 +887,7 @@ static void parse_svg(AppState* app, const char* svg_path) {
             continue;
         }
 
-        // 2. Parse <text ...>content</text>
+        // 2. <text ...>content</text>
         if (strncmp(tag_open, "<text", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
             const char* close_tag = strstr(tag_open, "</text>");
@@ -702,7 +920,6 @@ static void parse_svg(AppState* app, const char* svg_path) {
                 if ((a_str = find_attr_slice(tag_open, tag_end, "fill", &a_len))) {
                     parse_color_slice(a_str, a_len, &node->has_fill, &node->fill_color, node->fill_color);
                 }
-
                 if ((a_str = find_attr_slice(tag_open, tag_end, "transform", &a_len))) {
                     parse_svg_transform(a_str, a_len, &node->matrix);
                 } else {
@@ -715,17 +932,13 @@ static void parse_svg(AppState* app, const char* svg_path) {
 
                 if (node->text_len > 0) {
                     app->svg.text_count++;
-                    log_append("  [TEXT] family='%s', size=%.1f, len=%d, text='%s'",
-                               node->font_family, node->font_size, node->text_len, node->text);
                 } else {
                     app->svg.node_count--;
                 }
-
                 cur = close_tag + 7;
                 continue;
             }
         }
-
         cur = tag_open + 1;
     }
 
@@ -765,6 +978,17 @@ static void load_svg_file(AppState* app, const char* path) {
     strncpy(app->current_svg_path, path, MAX_PATH - 1);
     FontHelper_GetFontName(path, app->current_svg_name, sizeof(app->current_svg_name));
     app->has_svg_loaded = true;
+
+    // Auto-load corresponding A-yoloAnnot.yaml
+    char yml_path[MAX_PATH];
+    get_default_annot_path(path, yml_path, sizeof(yml_path));
+    if (GetFileAttributesA(yml_path) != INVALID_FILE_ATTRIBUTES) {
+        load_yolo_annotations(app, yml_path);
+    } else {
+        app->annotation_count = 0;
+        app->selected_annotation_idx = -1;
+        strncpy(app->annot_file_path, yml_path, MAX_PATH - 1);
+    }
 
     reset_view(app);
 }
@@ -825,20 +1049,15 @@ static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) 
             fprintf(f, "  <path transform=\"matrix(%g,%g,%g,%g,%g,%g)\" ",
                     node->matrix.a, node->matrix.b, node->matrix.c, node->matrix.d, node->matrix.e, node->matrix.f);
 
-            if (node->fill_rule == PLUTOVG_FILL_RULE_EVEN_ODD) {
-                fprintf(f, "fill-rule=\"evenodd\" ");
-            } else {
-                fprintf(f, "fill-rule=\"nonzero\" ");
-            }
+            if (node->fill_rule == PLUTOVG_FILL_RULE_EVEN_ODD) fprintf(f, "fill-rule=\"evenodd\" ");
+            else fprintf(f, "fill-rule=\"nonzero\" ");
 
             if (node->has_fill) {
                 fprintf(f, "fill=\"#%02X%02X%02X\" ",
                         (int)(node->fill_color.r * 255.0f + 0.5f),
                         (int)(node->fill_color.g * 255.0f + 0.5f),
                         (int)(node->fill_color.b * 255.0f + 0.5f));
-            } else {
-                fprintf(f, "fill=\"none\" ");
-            }
+            } else fprintf(f, "fill=\"none\" ");
 
             if (node->has_stroke) {
                 fprintf(f, "stroke=\"#%02X%02X%02X\" stroke-width=\"%g\" ",
@@ -873,7 +1092,6 @@ static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) 
                                  (int)(node->fill_color.g * 255.0f + 0.5f),
                                  (int)(node->fill_color.b * 255.0f + 0.5f));
                     }
-
                     fprintf(f, "  <path transform=\"matrix(%g,%g,%g,%g,%g,%g)\" fill=\"%s\" fill-rule=\"nonzero\" d=\"%s\"/>\n",
                             node->matrix.a, node->matrix.b, node->matrix.c, node->matrix.d, node->matrix.e, node->matrix.f,
                             fill_str, psb.data);
@@ -909,10 +1127,8 @@ static void resize_surface(AppState* app, int width, int height) {
 static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_save(canvas);
 
-    // 1. Grid
     plutovg_canvas_set_rgb(canvas, 0.18f, 0.20f, 0.23f);
     plutovg_canvas_set_line_width(canvas, 1.0f);
-
     const float step = 50.0f;
     const float extent = 5000.0f;
 
@@ -926,7 +1142,7 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     }
     plutovg_canvas_stroke(canvas);
 
-    // 2. X-Axis (Red) & Y-Axis (Green)
+    // X-Axis (Red) & Y-Axis (Green)
     plutovg_canvas_set_rgb(canvas, 0.85f, 0.25f, 0.25f);
     plutovg_canvas_set_line_width(canvas, 2.0f);
     plutovg_canvas_move_to(canvas, -extent, 0.0f);
@@ -939,7 +1155,7 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_line_to(canvas, 0.0f, extent);
     plutovg_canvas_stroke(canvas);
 
-    // 3. Directional Arrows
+    // Directional Arrows
     plutovg_canvas_set_rgb(canvas, 1.0f, 0.3f, 0.3f);
     plutovg_canvas_set_line_width(canvas, 3.0f);
     plutovg_canvas_move_to(canvas, 0.0f, 0.0f);
@@ -958,12 +1174,96 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_line_to(canvas, 5.0f, 37.0f);
     plutovg_canvas_stroke(canvas);
 
-    // Center Origin Dot
     plutovg_canvas_set_rgb(canvas, 1.0f, 0.85f, 0.2f);
     plutovg_canvas_arc(canvas, 0.0f, 0.0f, 3.5f, 0.0f, 6.2831853f, 0);
     plutovg_canvas_fill(canvas);
 
     plutovg_canvas_restore(canvas);
+}
+
+// --- Render Semi-Transparent YOLO Annotation Masks ---
+static void draw_annotations(AppState* app) {
+    if (!app->canvas) return;
+
+    for (int i = 0; i < app->annotation_count; ++i) {
+        YoloAnnotation* a = &app->annotations[i];
+        bool is_sel = (i == app->selected_annotation_idx);
+
+        const AnnotationCategory* cat = &DEFAULT_CATEGORIES[0];
+        if (a->class_id >= 0 && a->class_id < MAX_CATEGORIES) {
+            cat = &DEFAULT_CATEGORIES[a->class_id];
+        }
+
+        plutovg_canvas_save(app->canvas);
+
+        // 1. Semi-transparent fill mask (35% opacity normally, 50% if selected)
+        plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, is_sel ? 0.50f : 0.35f);
+        plutovg_canvas_fill_rect(app->canvas, a->x, a->y, a->w, a->h);
+
+        // 2. Solid Border
+        plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, 0.95f);
+        plutovg_canvas_set_line_width(app->canvas, is_sel ? 2.5f / app->zoom : 1.5f / app->zoom);
+        plutovg_canvas_stroke_rect(app->canvas, a->x, a->y, a->w, a->h);
+
+        // 3. Label Badge on top-left of box
+        if (app->registry.fallback_face) {
+            float badge_h = 16.0f / app->zoom;
+            float font_sz = 11.0f / app->zoom;
+
+            plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, 0.95f);
+            plutovg_canvas_fill_rect(app->canvas, a->x, a->y - badge_h, a->w > 80.0f ? 80.0f : a->w, badge_h);
+
+            plutovg_canvas_set_font_face(app->canvas, app->registry.fallback_face);
+            plutovg_canvas_set_font_size(app->canvas, font_sz);
+            plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
+
+            char badge[64];
+            snprintf(badge, sizeof(badge), "[%d] %s", a->class_id, a->class_name);
+            plutovg_canvas_fill_text(app->canvas, badge, -1, PLUTOVG_TEXT_ENCODING_UTF8, a->x + 2.0f / app->zoom, a->y - 3.0f / app->zoom);
+        }
+
+        // 4. Resize corner handles if selected
+        if (is_sel) {
+            float hs = 8.0f / app->zoom;
+            float hs2 = hs / 2.0f;
+            plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
+            plutovg_canvas_set_line_width(app->canvas, 1.0f / app->zoom);
+
+            float cx[4] = { a->x, a->x + a->w, a->x, a->x + a->w };
+            float cy[4] = { a->y, a->y, a->y + a->h, a->y + a->h };
+
+            for (int k = 0; k < 4; ++k) {
+                plutovg_canvas_fill_rect(app->canvas, cx[k] - hs2, cy[k] - hs2, hs, hs);
+                plutovg_canvas_set_rgb(app->canvas, 0.1f, 0.1f, 0.1f);
+                plutovg_canvas_stroke_rect(app->canvas, cx[k] - hs2, cy[k] - hs2, hs, hs);
+                plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
+            }
+        }
+
+        plutovg_canvas_restore(app->canvas);
+    }
+
+    // Draw live drag box preview
+    if (app->is_drawing_box) {
+        float x1 = app->drag_start_canvas_x;
+        float y1 = app->drag_start_canvas_y;
+        float x2 = app->drag_curr_canvas_x;
+        float y2 = app->drag_curr_canvas_y;
+        float bx = x1 < x2 ? x1 : x2;
+        float by = y1 < y2 ? y1 : y2;
+        float bw = fabsf(x2 - x1);
+        float bh = fabsf(y2 - y1);
+
+        const AnnotationCategory* cat = &DEFAULT_CATEGORIES[app->active_class_id];
+        plutovg_canvas_save(app->canvas);
+        plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, 0.35f);
+        plutovg_canvas_fill_rect(app->canvas, bx, by, bw, bh);
+
+        plutovg_canvas_set_rgba(app->canvas, 1.0f, 1.0f, 1.0f, 0.95f);
+        plutovg_canvas_set_line_width(app->canvas, 1.5f / app->zoom);
+        plutovg_canvas_stroke_rect(app->canvas, bx, by, bw, bh);
+        plutovg_canvas_restore(app->canvas);
+    }
 }
 
 static void render(AppState* app) {
@@ -996,14 +1296,11 @@ static void render(AppState* app) {
 
         for (int i = 0; i < app->svg.node_count; ++i) {
             SvgNode* node = &app->svg.nodes[i];
-
             plutovg_canvas_save(app->canvas);
             plutovg_canvas_transform(app->canvas, &node->matrix);
 
             if (node->type == SVG_NODE_PATH && node->path) {
-                // Apply winding rule (crucial for hollow glyphs like R, 8, B, O)
                 plutovg_canvas_set_fill_rule(app->canvas, node->fill_rule);
-
                 if (node->has_fill) {
                     plutovg_canvas_set_color(app->canvas, &node->fill_color);
                     plutovg_canvas_fill_path(app->canvas, node->path);
@@ -1021,14 +1318,14 @@ static void render(AppState* app) {
                     plutovg_canvas_set_font_face(app->canvas, face);
                     plutovg_canvas_set_font_size(app->canvas, node->font_size);
                     plutovg_canvas_set_color(app->canvas, &node->fill_color);
-
-                    plutovg_canvas_fill_text(app->canvas, node->text, node->text_len,
-                                            PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
+                    plutovg_canvas_fill_text(app->canvas, node->text, node->text_len, PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
                 }
             }
-
             plutovg_canvas_restore(app->canvas);
         }
+
+        // Draw YOLO Annotations overlay
+        draw_annotations(app);
     }
 
     plutovg_canvas_restore(app->canvas);
@@ -1044,7 +1341,7 @@ static void zoom_at(AppState* app, float sx, float sy, float factor) {
     app->zoom = new_zoom;
 }
 
-static bool browse_file(HWND parent, const char* filter, char* out_path, size_t max_len, bool is_save) {
+static bool browse_file(HWND parent, const char* filter, char* out_path, size_t max_len, bool is_save, const char* def_ext) {
     OPENFILENAMEA ofn = {0};
     char buf[MAX_PATH] = {0};
     ofn.lStructSize = sizeof(OPENFILENAMEA);
@@ -1056,7 +1353,7 @@ static bool browse_file(HWND parent, const char* filter, char* out_path, size_t 
 
     if (is_save) {
         ofn.Flags |= OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        ofn.lpstrDefExt = "svg";
+        ofn.lpstrDefExt = def_ext;
         if (GetSaveFileNameA(&ofn)) {
             strncpy(out_path, buf, max_len - 1);
             return true;
@@ -1075,9 +1372,7 @@ static bool browse_file(HWND parent, const char* filter, char* out_path, size_t 
 static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_SIZE:
-        if (g_app.hwnd_log_edit) {
-            MoveWindow(g_app.hwnd_log_edit, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE);
-        }
+        if (g_app.hwnd_log_edit) MoveWindow(g_app.hwnd_log_edit, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE);
         return 0;
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
@@ -1094,6 +1389,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         DragAcceptFiles(hwnd, TRUE);
         g_app.show_grid = true;
         g_app.zoom = 1.0f;
+        g_app.interaction_mode = APP_MODE_NAVIGATE;
+        g_app.active_class_id = 0;
+        g_app.selected_annotation_idx = -1;
         return 0;
     }
 
@@ -1118,38 +1416,129 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         short delta = GET_WHEEL_DELTA_WPARAM(wParam);
         float factor = (delta > 0) ? 1.15f : (1.0f / 1.15f);
         zoom_at(&g_app, (float)pt.x, (float)pt.y, factor);
-
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
 
     case WM_LBUTTONDOWN: {
-        g_app.is_dragging = true;
-        g_app.last_mouse.x = GET_X_LPARAM(lParam);
-        g_app.last_mouse.y = GET_Y_LPARAM(lParam);
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        float cx, cy;
+        screen_to_canvas(&g_app, (float)mx, (float)my, &cx, &cy);
+
         SetCapture(hwnd);
+
+        if (g_app.interaction_mode == APP_MODE_ANNOTATE) {
+            // Start drawing a new bounding box
+            g_app.is_drawing_box = true;
+            g_app.drag_start_canvas_x = cx;
+            g_app.drag_start_canvas_y = cy;
+            g_app.drag_curr_canvas_x = cx;
+            g_app.drag_curr_canvas_y = cy;
+        } else {
+            // Navigate/Select Mode: Hit test annotations and handles
+            ResizeHandle handle = HANDLE_NONE;
+            int hit = hit_test_annotations(&g_app, cx, cy, &handle);
+
+            if (hit >= 0) {
+                g_app.selected_annotation_idx = hit;
+                g_app.active_handle = handle;
+                g_app.is_transforming_box = true;
+                g_app.drag_start_canvas_x = cx;
+                g_app.drag_start_canvas_y = cy;
+            } else {
+                // Pan Canvas
+                g_app.selected_annotation_idx = -1;
+                g_app.is_dragging_view = true;
+                g_app.last_mouse.x = mx;
+                g_app.last_mouse.y = my;
+            }
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
 
     case WM_MOUSEMOVE: {
-        if (g_app.is_dragging) {
-            int mx = GET_X_LPARAM(lParam);
-            int my = GET_Y_LPARAM(lParam);
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        float cx, cy;
+        screen_to_canvas(&g_app, (float)mx, (float)my, &cx, &cy);
 
+        if (g_app.is_drawing_box) {
+            g_app.drag_curr_canvas_x = cx;
+            g_app.drag_curr_canvas_y = cy;
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (g_app.is_transforming_box && g_app.selected_annotation_idx >= 0) {
+            YoloAnnotation* a = &g_app.annotations[g_app.selected_annotation_idx];
+            float dcx = cx - g_app.drag_start_canvas_x;
+            float dcy = cy - g_app.drag_start_canvas_y;
+
+            if (g_app.active_handle == HANDLE_BODY) {
+                update_annotation_normalized(&g_app, a, a->x + dcx, a->y + dcy, a->w, a->h);
+            } else if (g_app.active_handle == HANDLE_TOP_LEFT) {
+                update_annotation_normalized(&g_app, a, a->x + dcx, a->y + dcy, a->w - dcx, a->h - dcy);
+            } else if (g_app.active_handle == HANDLE_TOP_RIGHT) {
+                update_annotation_normalized(&g_app, a, a->x, a->y + dcy, a->w + dcx, a->h - dcy);
+            } else if (g_app.active_handle == HANDLE_BOTTOM_LEFT) {
+                update_annotation_normalized(&g_app, a, a->x + dcx, a->y, a->w - dcx, a->h + dcy);
+            } else if (g_app.active_handle == HANDLE_BOTTOM_RIGHT) {
+                update_annotation_normalized(&g_app, a, a->x, a->y, a->w + dcx, a->h + dcy);
+            }
+
+            g_app.drag_start_canvas_x = cx;
+            g_app.drag_start_canvas_y = cy;
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (g_app.is_dragging_view) {
             g_app.pan_x += (float)(mx - g_app.last_mouse.x);
             g_app.pan_y += (float)(my - g_app.last_mouse.y);
-
             g_app.last_mouse.x = mx;
             g_app.last_mouse.y = my;
-
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
     }
 
     case WM_LBUTTONUP: {
-        if (g_app.is_dragging) {
-            g_app.is_dragging = false;
+        if (g_app.is_drawing_box) {
+            g_app.is_drawing_box = false;
+            float x1 = g_app.drag_start_canvas_x;
+            float y1 = g_app.drag_start_canvas_y;
+            float x2 = g_app.drag_curr_canvas_x;
+            float y2 = g_app.drag_curr_canvas_y;
+            float bw = fabsf(x2 - x1);
+            float bh = fabsf(y2 - y1);
+
+            if (bw > 4.0f && bh > 4.0f && g_app.annotation_count < MAX_ANNOTATIONS) {
+                YoloAnnotation* a = &g_app.annotations[g_app.annotation_count++];
+                a->id = g_app.annotation_count - 1;
+                a->class_id = g_app.active_class_id;
+                strncpy(a->class_name, DEFAULT_CATEGORIES[g_app.active_class_id].name, sizeof(a->class_name) - 1);
+                update_annotation_normalized(&g_app, a, x1 < x2 ? x1 : x2, y1 < y2 ? y1 : y2, bw, bh);
+                g_app.selected_annotation_idx = g_app.annotation_count - 1;
+                log_append("[ANNOT] Added box #%d: [%.3f, %.3f, %.3f, %.3f] (class: %s)",
+                           a->id, a->x_center, a->y_center, a->width, a->height, a->class_name);
+            }
+        }
+        g_app.is_transforming_box = false;
+        g_app.is_dragging_view = false;
+        g_app.active_handle = HANDLE_NONE;
+        ReleaseCapture();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_RBUTTONDOWN: {
+        // Right-drag always pans
+        g_app.is_dragging_view = true;
+        g_app.last_mouse.x = GET_X_LPARAM(lParam);
+        g_app.last_mouse.y = GET_Y_LPARAM(lParam);
+        SetCapture(hwnd);
+        return 0;
+    }
+
+    case WM_RBUTTONUP: {
+        if (g_app.is_dragging_view) {
+            g_app.is_dragging_view = false;
             ReleaseCapture();
         }
         return 0;
@@ -1161,55 +1550,45 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         float pan_step = shift ? 120.0f : 40.0f;
 
         switch (wParam) {
-        case VK_LEFT:
-            g_app.pan_x += pan_step;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case VK_RIGHT:
-            g_app.pan_x -= pan_step;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case VK_UP:
-            g_app.pan_y += pan_step;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case VK_DOWN:
-            g_app.pan_y -= pan_step;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case 'E':
-            if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_EXPORT_SVG, 0);
+        case VK_LEFT:  g_app.pan_x += pan_step; InvalidateRect(hwnd, NULL, FALSE); break;
+        case VK_RIGHT: g_app.pan_x -= pan_step; InvalidateRect(hwnd, NULL, FALSE); break;
+        case VK_UP:    g_app.pan_y += pan_step; InvalidateRect(hwnd, NULL, FALSE); break;
+        case VK_DOWN:  g_app.pan_y -= pan_step; InvalidateRect(hwnd, NULL, FALSE); break;
+        case 'S':
+            if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_SAVE_ANNOT, 0);
+            else { g_app.shear_x += shift ? -0.05f : 0.05f; InvalidateRect(hwnd, NULL, FALSE); }
             break;
         case 'O':
             if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_SVG, 0);
             else SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_FONT, 0);
             break;
-        case 'L':
-            SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_LOG, 0);
+        case 'E':
+            if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_EXPORT_SVG, 0);
             break;
-        case 'G':
-            SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_GRID, 0);
+        case 'N':
+        case VK_TAB:
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_MODE, 0);
             break;
-        case VK_SPACE:
-        case '0':
-            SendMessage(hwnd, WM_COMMAND, ID_MENU_RESET_VIEW, 0);
+        case 'C':
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_CYCLE_CLASS, 0);
             break;
+        case VK_DELETE:
+        case VK_BACK:
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_DELETE_ANNOT, 0);
+            break;
+        case '1': case '2': case '3': case '4':
+        case '5': case '6': case '7': case '8':
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_CLASS_BASE + (int)(wParam - '1'), 0);
+            break;
+        case 'L': SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_LOG, 0); break;
+        case 'G': SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_GRID, 0); break;
+        case VK_SPACE: SendMessage(hwnd, WM_COMMAND, ID_MENU_RESET_VIEW, 0); break;
         case 'R':
             g_app.rotation_deg += shift ? -5.0f : 5.0f;
             InvalidateRect(hwnd, NULL, FALSE);
             break;
-        case 'S':
-            g_app.shear_x += shift ? -0.05f : 0.05f;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case VK_OEM_PLUS:
-        case VK_ADD:
-            SendMessage(hwnd, WM_COMMAND, ID_MENU_ZOOM_IN, 0);
-            break;
-        case VK_OEM_MINUS:
-        case VK_SUBTRACT:
-            SendMessage(hwnd, WM_COMMAND, ID_MENU_ZOOM_OUT, 0);
-            break;
+        case VK_OEM_PLUS: case VK_ADD: SendMessage(hwnd, WM_COMMAND, ID_MENU_ZOOM_IN, 0); break;
+        case VK_OEM_MINUS: case VK_SUBTRACT: SendMessage(hwnd, WM_COMMAND, ID_MENU_ZOOM_OUT, 0); break;
         }
         return 0;
     }
@@ -1221,7 +1600,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             const char* ext = PathFindExtensionA(file);
             if (_stricmp(ext, ".svg") == 0) {
                 load_svg_file(&g_app, file);
-            } else if (_stricmp(ext, ".ttf") == 0 || _stricmp(ext, ".otf") == 0 || _stricmp(ext, ".ttc") == 0) {
+            } else if (_stricmp(ext, ".yaml") == 0 || _stricmp(ext, ".yml") == 0) {
+                load_yolo_annotations(&g_app, file);
+            } else if (_stricmp(ext, ".ttf") == 0 || _stricmp(ext, ".otf") == 0) {
                 registry_add_font(&g_app.registry, PathFindFileNameA(file), file);
             }
             InvalidateRect(hwnd, NULL, FALSE);
@@ -1231,10 +1612,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_COMMAND: {
-        switch (LOWORD(wParam)) {
+        int cmd = LOWORD(wParam);
+        if (cmd >= ID_MENU_CLASS_BASE && cmd < ID_MENU_CLASS_BASE + MAX_CATEGORIES) {
+            int cid = cmd - ID_MENU_CLASS_BASE;
+            g_app.active_class_id = cid;
+            if (g_app.selected_annotation_idx >= 0 && g_app.selected_annotation_idx < g_app.annotation_count) {
+                YoloAnnotation* a = &g_app.annotations[g_app.selected_annotation_idx];
+                a->class_id = cid;
+                strncpy(a->class_name, DEFAULT_CATEGORIES[cid].name, sizeof(a->class_name) - 1);
+            }
+            log_append("[ANNOT] Active Class set to: [%d] %s", cid, DEFAULT_CATEGORIES[cid].name);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
+        switch (cmd) {
         case ID_MENU_OPEN_SVG: {
             char path[MAX_PATH];
-            if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path), false)) {
+            if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path), false, "svg")) {
                 load_svg_file(&g_app, path);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -1242,10 +1637,58 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case ID_MENU_OPEN_FONT: {
             char path[MAX_PATH];
-            if (browse_file(hwnd, "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0", path, sizeof(path), false)) {
+            if (browse_file(hwnd, "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0", path, sizeof(path), false, "ttf")) {
                 registry_add_font(&g_app.registry, PathFindFileNameA(path), path);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            break;
+        }
+        case ID_MENU_SAVE_ANNOT: {
+            if (strlen(g_app.annot_file_path) > 0) {
+                save_yolo_annotations(&g_app, g_app.annot_file_path);
+            } else {
+                SendMessage(hwnd, WM_COMMAND, ID_MENU_SAVE_ANNOT_AS, 0);
+            }
+            break;
+        }
+        case ID_MENU_SAVE_ANNOT_AS: {
+            char path[MAX_PATH];
+            if (browse_file(hwnd, "YOLO Annotation YAML (*.yaml)\0*.yaml\0All Files (*.*)\0*.*\0", path, sizeof(path), true, "yaml")) {
+                save_yolo_annotations(&g_app, path);
+            }
+            break;
+        }
+        case ID_MENU_TOGGLE_MODE: {
+            g_app.interaction_mode = (g_app.interaction_mode == APP_MODE_NAVIGATE) ? APP_MODE_ANNOTATE : APP_MODE_NAVIGATE;
+            CheckMenuItem(GetMenu(hwnd), ID_MENU_TOGGLE_MODE, (g_app.interaction_mode == APP_MODE_ANNOTATE) ? MF_CHECKED : MF_UNCHECKED);
+            log_append("[MODE] Switched to %s Mode (Tab/N to toggle)", 
+                       (g_app.interaction_mode == APP_MODE_ANNOTATE) ? "DRAW ANNOTATION BOX" : "NAVIGATE / SELECT");
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        }
+        case ID_MENU_DELETE_ANNOT: {
+            if (g_app.selected_annotation_idx >= 0 && g_app.selected_annotation_idx < g_app.annotation_count) {
+                for (int i = g_app.selected_annotation_idx; i < g_app.annotation_count - 1; ++i) {
+                    g_app.annotations[i] = g_app.annotations[i + 1];
+                    g_app.annotations[i].id = i;
+                }
+                g_app.annotation_count--;
+                g_app.selected_annotation_idx = -1;
+                log_append("[ANNOT] Deleted annotation.");
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        }
+        case ID_MENU_CLEAR_ANNOT: {
+            g_app.annotation_count = 0;
+            g_app.selected_annotation_idx = -1;
+            log_append("[ANNOT] Cleared all annotations.");
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        }
+        case ID_MENU_CYCLE_CLASS: {
+            g_app.active_class_id = (g_app.active_class_id + 1) % MAX_CATEGORIES;
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_CLASS_BASE + g_app.active_class_id, 0);
             break;
         }
         case ID_MENU_EXPORT_SVG: {
@@ -1254,7 +1697,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 break;
             }
             char path[MAX_PATH];
-            if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path), true)) {
+            if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path), true, "svg")) {
                 export_svg_with_embedded_paths(&g_app, path);
             }
             break;
@@ -1288,7 +1731,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-
         render(&g_app);
 
         if (g_app.surface) {
@@ -1306,7 +1748,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, data, &bmi, DIB_RGB_COLORS, SRCCOPY);
         }
-
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1331,19 +1772,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 static void create_app_menu(HWND hwnd) {
     HMENU hMenuBar = CreateMenu();
     HMENU hFileMenu = CreateMenu();
+    HMENU hEditMenu = CreateMenu();
+    HMENU hClassMenu = CreateMenu();
     HMENU hViewMenu = CreateMenu();
 
+    // File Menu
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_OPEN_SVG, "Open .&SVG...\t(Ctrl+O)");
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_OPEN_FONT, "Open &Font...\t(O)");
+    AppendMenuA(hFileMenu, MF_STRING, ID_MENU_SAVE_ANNOT, "&Save YOLO Annotations\t(Ctrl+S)");
+    AppendMenuA(hFileMenu, MF_STRING, ID_MENU_SAVE_ANNOT_AS, "Save YOLO Annotations &As...");
+    AppendMenuA(hFileMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_EXPORT_SVG, "&Export SVG (Glyphs to Paths)...\t(Ctrl+E)");
     AppendMenuA(hFileMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hFileMenu, MF_STRING, ID_MENU_EXIT, "E&xit");
 
+    // Edit Menu
+    AppendMenuA(hEditMenu, MF_STRING | MF_UNCHECKED, ID_MENU_TOGGLE_MODE, "&Draw Box Mode\t(Tab / N)");
+    AppendMenuA(hEditMenu, MF_STRING, ID_MENU_DELETE_ANNOT, "&Delete Selected Box\t(Del)");
+    AppendMenuA(hEditMenu, MF_STRING, ID_MENU_CLEAR_ANNOT, "&Clear All Annotations");
+    AppendMenuA(hEditMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hEditMenu, MF_STRING, ID_MENU_CYCLE_CLASS, "C&ycle Active Class\t(C)");
+
+    // Category / Class Menu
+    for (int i = 0; i < MAX_CATEGORIES; ++i) {
+        char item[64];
+        snprintf(item, sizeof(item), "[%d] %s\t(%d)", i, DEFAULT_CATEGORIES[i].name, i + 1);
+        AppendMenuA(hClassMenu, MF_STRING, ID_MENU_CLASS_BASE + i, item);
+    }
+
+    // View Menu
     AppendMenuA(hViewMenu, MF_STRING, ID_MENU_RESET_VIEW, "&Reset View\t(Space)");
     AppendMenuA(hViewMenu, MF_STRING, ID_MENU_TOGGLE_GRID, "Toggle &Grid & Origin\t(G)");
     AppendMenuA(hViewMenu, MF_STRING | MF_UNCHECKED, ID_MENU_TOGGLE_LOG, "Show Debug &Log\t(L)");
 
     AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, "&File");
+    AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hEditMenu, "&Edit");
+    AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hClassMenu, "&Class");
     AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hViewMenu, "&View");
 
     SetMenu(hwnd, hMenuBar);
@@ -1358,14 +1822,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         typedef BOOL (WINAPI *SetProcessDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
         SetProcessDpiAwarenessContextProc setDpiContext = 
             (SetProcessDpiAwarenessContextProc)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
-        if (setDpiContext) {
-            setDpiContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        } else {
-            SetProcessDPIAware();
-        }
+        if (setDpiContext) setDpiContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        else SetProcessDPIAware();
     }
 
-    // 1. Main Window Class
     WNDCLASSEXA wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXA);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1375,7 +1835,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.lpszClassName = "PlutoVGViewerWindowClass";
     if (!RegisterClassExA(&wc)) return 1;
 
-    // 2. Modeless Log Window Class
     WNDCLASSEXA log_wc = {0};
     log_wc.cbSize = sizeof(WNDCLASSEXA);
     log_wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1386,23 +1845,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     log_wc.lpszClassName = "PlutoVGLogWindowClass";
     RegisterClassExA(&log_wc);
 
-    // 3. Create Main Window
     g_app.hwnd_main = CreateWindowExA(
         WS_EX_ACCEPTFILES,
         wc.lpszClassName,
-        "PlutoVG Typography & SVG Viewer",
+        "PlutoVG Typography & YOLO Annotation Editor",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        1100, 800,
+        1150, 820,
         NULL, NULL, hInstance, NULL
     );
     if (!g_app.hwnd_main) return 1;
 
-    // 4. Create Modeless Popup Log Window (Hidden by Default)
     g_app.hwnd_log = CreateWindowExA(
         WS_EX_TOOLWINDOW,
         log_wc.lpszClassName,
-        "SVG & Typography Debug Log",
+        "SVG & YOLO Annotation Debug Log",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         640, 480,
@@ -1414,16 +1871,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         RECT rc;
         GetClientRect(g_app.hwnd_log, &rc);
         g_app.hwnd_log_edit = CreateWindowExA(
-            0,
-            "EDIT",
-            "",
+            0, "EDIT", "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
             0, 0, rc.right, rc.bottom,
             g_app.hwnd_log,
             (HMENU)IDC_LOG_EDIT,
-            hInstance,
-            NULL
+            hInstance, NULL
         );
 
         g_app.hfont_log = CreateFontA(
@@ -1431,22 +1885,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas"
         );
-        if (g_app.hfont_log) {
-            SendMessageA(g_app.hwnd_log_edit, WM_SETFONT, (WPARAM)g_app.hfont_log, TRUE);
-        }
+        if (g_app.hfont_log) SendMessageA(g_app.hwnd_log_edit, WM_SETFONT, (WPARAM)g_app.hfont_log, TRUE);
     }
 
     create_app_menu(g_app.hwnd_main);
 
-    // 5. Accelerator Table
+    // Accelerator Table
     ACCEL accels[] = {
         { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
+        { FCONTROL | FVIRTKEY, 'S', ID_MENU_SAVE_ANNOT },
         { FCONTROL | FVIRTKEY, 'E', ID_MENU_EXPORT_SVG },
         { FVIRTKEY, 'O', ID_MENU_OPEN_FONT },
+        { FVIRTKEY, 'N', ID_MENU_TOGGLE_MODE },
+        { FVIRTKEY, VK_TAB, ID_MENU_TOGGLE_MODE },
+        { FVIRTKEY, 'C', ID_MENU_CYCLE_CLASS },
+        { FVIRTKEY, VK_DELETE, ID_MENU_DELETE_ANNOT },
+        { FVIRTKEY, VK_BACK, ID_MENU_DELETE_ANNOT },
         { FVIRTKEY, 'L', ID_MENU_TOGGLE_LOG },
         { FVIRTKEY, 'G', ID_MENU_TOGGLE_GRID },
         { FVIRTKEY, VK_SPACE, ID_MENU_RESET_VIEW },
-        { FVIRTKEY, '0', ID_MENU_RESET_VIEW },
         { FVIRTKEY, VK_OEM_PLUS, ID_MENU_ZOOM_IN },
         { FVIRTKEY, VK_ADD, ID_MENU_ZOOM_IN },
         { FVIRTKEY, VK_OEM_MINUS, ID_MENU_ZOOM_OUT },
@@ -1457,7 +1914,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(g_app.hwnd_main, nCmdShow);
     UpdateWindow(g_app.hwnd_main);
 
-    // 6. Check Command Line Argument
     int argc = 0;
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argvW && argc > 1) {
@@ -1472,7 +1928,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         InvalidateRect(g_app.hwnd_main, NULL, FALSE);
     }
 
-    // 7. Message Loop
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0)) {
         if (!TranslateAcceleratorA(g_app.hwnd_main, hAccel, &msg)) {
