@@ -14,35 +14,45 @@
 #include "font_helper.h"
 
 // Command IDs
-#define ID_MENU_OPEN_SVG      1001
-#define ID_MENU_OPEN_FONT     1002
-#define ID_MENU_SAVE_ANNOT    1003
-#define ID_MENU_SAVE_ANNOT_AS 1004
-#define ID_MENU_EXPORT_SVG    1005
-#define ID_MENU_EXIT          1006
+#define ID_MENU_OPEN_SVG          1001
+#define ID_MENU_OPEN_FONT         1002
+#define ID_MENU_SAVE_ANNOT        1003
+#define ID_MENU_SAVE_ANNOT_AS     1004
+#define ID_MENU_EXPORT_SVG        1005
+#define ID_MENU_EXIT              1006
 
-#define ID_MENU_RESET_VIEW    1010
-#define ID_MENU_TOGGLE_GRID   1011
-#define ID_MENU_TOGGLE_LOG    1012
-#define ID_MENU_TOGGLE_MODE   1013
-#define ID_MENU_DELETE_ANNOT  1014
-#define ID_MENU_CLEAR_ANNOT   1015
-#define ID_MENU_CYCLE_CLASS   1016
+#define ID_MENU_RESET_VIEW        1010
+#define ID_MENU_TOGGLE_GRID       1011
+#define ID_MENU_TOGGLE_LOG        1012
+#define ID_MENU_TOGGLE_MODE       1013
+#define ID_MENU_TOGGLE_SELECTABLE 1014
+#define ID_MENU_DELETE_ANNOT      1015
+#define ID_MENU_CLEAR_ANNOT       1016
+#define ID_MENU_CYCLE_CLASS       1017
+#define ID_MENU_EDIT_URLLINK      1018
 
-#define ID_MENU_CLASS_BASE    1100
-#define ID_MENU_ZOOM_IN       1201
-#define ID_MENU_ZOOM_OUT      1202
+#define ID_MENU_CLASS_BASE        1100
+#define ID_MENU_ZOOM_IN           1201
+#define ID_MENU_ZOOM_OUT          1202
 
-#define IDC_LOG_EDIT          2001
-#define MAX_FONTS             64
-#define MAX_SVG_NODES         8192
-#define MAX_ANNOTATIONS       512
-#define MAX_CATEGORIES        8
+#define IDC_LOG_EDIT              2001
 
-// --- Annotation Mode & Handles ---
+// URL Dialog Controls
+#define IDC_DLG_URL_EDIT          3001
+#define IDC_DLG_VIEWPORT_EDIT     3002
+#define IDC_DLG_BTN_BROWSE        3003
+#define IDC_DLG_BTN_CAPTURE       3004
+#define IDC_DLG_BTN_OK            3005
+#define IDC_DLG_BTN_CANCEL        3006
+
+#define MAX_FONTS                 64
+#define MAX_SVG_NODES             8192
+#define MAX_ANNOTATIONS           512
+#define MAX_CATEGORIES            9
+
 typedef enum {
-    APP_MODE_NAVIGATE, // Left drag = pan
-    APP_MODE_ANNOTATE  // Left drag = draw new bbox
+    APP_MODE_NAVIGATE,
+    APP_MODE_ANNOTATE
 } AppInteractionMode;
 
 typedef enum {
@@ -54,7 +64,6 @@ typedef enum {
     HANDLE_BOTTOM_RIGHT
 } ResizeHandle;
 
-// --- Category Palette ---
 typedef struct {
     int id;
     char name[32];
@@ -69,26 +78,32 @@ static const AnnotationCategory DEFAULT_CATEGORIES[MAX_CATEGORIES] = {
     { 4, "fraction", 0.70f, 0.30f, 0.90f }, // Purple
     { 5, "matrix",   0.10f, 0.80f, 0.85f }, // Cyan
     { 6, "script",   0.95f, 0.85f, 0.15f }, // Yellow
-    { 7, "diagram",  0.95f, 0.30f, 0.65f }  // Pink
+    { 7, "diagram",  0.95f, 0.30f, 0.65f }, // Pink
+    { 8, "urllink",  0.05f, 0.85f, 0.80f }  // Vibrant Teal (Special URL link class)
 };
 
-// --- YOLO Annotation Structure ---
+// --- Extended YOLO Annotation Structure ---
 typedef struct {
     int id;
     int class_id;
     char class_name[32];
-    
+
     // Normalized YOLO format [0..1]: [x_center, y_center, width, height]
     float x_center;
     float y_center;
     float width;
     float height;
 
-    // Computed absolute canvas coords [x, y, w, h]
+    // Absolute canvas coords [x, y, w, h]
     float x, y, w, h;
+
+    // URL Link Extension
+    char url[512];
+    bool has_dest_viewport;
+    float dest_viewport[4]; // [x, y, w, h]
 } YoloAnnotation;
 
-// --- Font Lookup Registry for SVG ---
+// --- Font Lookup Registry ---
 typedef struct {
     char key[128];
     char file_path[MAX_PATH];
@@ -101,7 +116,6 @@ typedef struct {
     plutovg_font_face_t* fallback_face;
 } FontRegistry;
 
-// --- Node Types in SVG ---
 typedef enum {
     SVG_NODE_PATH,
     SVG_NODE_TEXT
@@ -145,6 +159,7 @@ typedef struct {
     HWND hwnd_log;
     HWND hwnd_log_edit;
     HFONT hfont_log;
+    HWND hwnd_urldlg;
 
     // Viewport
     float zoom;
@@ -153,7 +168,7 @@ typedef struct {
     float rotation_deg;
     float shear_x;
 
-    // Drag / Interaction State
+    // Mouse Interaction
     bool is_dragging_view;
     bool is_drawing_box;
     bool is_transforming_box;
@@ -164,21 +179,22 @@ typedef struct {
     float drag_curr_canvas_x;
     float drag_curr_canvas_y;
 
-    // Annotation Data
+    // Annotation Data & Settings
     AppInteractionMode interaction_mode;
+    bool annotations_selectable; // Thing B: Toggle selectable annotations
     YoloAnnotation annotations[MAX_ANNOTATIONS];
     int annotation_count;
     int selected_annotation_idx;
     int active_class_id;
     char annot_file_path[MAX_PATH];
 
-    // Window buffer
+    // Canvas Surface
     int width;
     int height;
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
 
-    // Document & Registry
+    // Fonts & SVG
     char current_svg_path[MAX_PATH];
     char current_svg_name[128];
     char fonts_dir[MAX_PATH];
@@ -186,6 +202,9 @@ typedef struct {
     SvgDocument svg;
     bool has_svg_loaded;
     bool show_grid;
+
+    // Monospace UI Font (Thing A)
+    plutovg_font_face_t* system_mono_face;
 } AppState;
 
 static AppState g_app;
@@ -222,7 +241,7 @@ static void psb_free(PathStringBuffer* b) {
     b->size = b->capacity = 0;
 }
 
-// --- Non-Modal Logging Window Helper Functions ---
+// --- Logging Helper Functions ---
 
 static void log_clear(void) {
     if (g_app.hwnd_log_edit) SetWindowTextA(g_app.hwnd_log_edit, "");
@@ -250,7 +269,26 @@ static void toggle_log_window(void) {
     CheckMenuItem(GetMenu(g_app.hwnd_main), ID_MENU_TOGGLE_LOG, !is_visible ? MF_CHECKED : MF_UNCHECKED);
 }
 
-// --- Coordinate Conversions ---
+// --- System Monospace Font Loader (Thing A) ---
+
+static void load_system_mono_font(AppState* app) {
+    const char* sys_fonts[] = {
+        "C:\\Windows\\Fonts\\consola.ttf",
+        "C:\\Windows\\Fonts\\cour.ttf",
+        "C:\\Windows\\Fonts\\lucon.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf"
+    };
+
+    for (size_t i = 0; i < sizeof(sys_fonts) / sizeof(sys_fonts[0]); ++i) {
+        if (GetFileAttributesA(sys_fonts[i]) != INVALID_FILE_ATTRIBUTES) {
+            app->system_mono_face = plutovg_font_face_load_from_file(sys_fonts[i], 0);
+            if (app->system_mono_face) return;
+        }
+    }
+}
+
+// --- Coordinate Conversions & Viewport Focus ---
 
 static void screen_to_canvas(AppState* app, float sx, float sy, float* cx, float* cy) {
     float dx = (sx - app->pan_x) / app->zoom;
@@ -258,6 +296,21 @@ static void screen_to_canvas(AppState* app, float sx, float sy, float* cx, float
     float rad = -app->rotation_deg * (3.1415926535f / 180.0f);
     *cx = dx * cosf(rad) - dy * sinf(rad);
     *cy = dx * sinf(rad) + dy * cosf(rad);
+}
+
+static void focus_viewport_bbox(AppState* app, float bx, float by, float bw, float bh) {
+    if (bw <= 0 || bh <= 0 || app->width <= 0 || app->height <= 0) return;
+
+    float sx = ((float)app->width * 0.90f) / bw;
+    float sy = ((float)app->height * 0.90f) / bh;
+    app->zoom = (sx < sy) ? sx : sy;
+    app->rotation_deg = 0.0f;
+    app->shear_x = 0.0f;
+
+    float box_center_x = bx + bw / 2.0f;
+    float box_center_y = by + bh / 2.0f;
+    app->pan_x = ((float)app->width / 2.0f) - (box_center_x * app->zoom);
+    app->pan_y = ((float)app->height / 2.0f) - (box_center_y * app->zoom);
 }
 
 static void update_annotation_pixels(AppState* app, YoloAnnotation* a) {
@@ -284,7 +337,7 @@ static void update_annotation_normalized(AppState* app, YoloAnnotation* a, float
     a->y_center = (y + h / 2.0f) / sh;
 }
 
-// --- YOLO YAML Serializer & Loader ---
+// --- Extended YOLO YAML Serializer & Loader (Thing C) ---
 
 static void get_default_annot_path(const char* svg_path, char* out_yaml, size_t max_len) {
     strncpy(out_yaml, svg_path, max_len - 1);
@@ -302,7 +355,7 @@ static bool save_yolo_annotations(AppState* app, const char* yaml_path) {
         return false;
     }
 
-    fprintf(f, "# YOLO Annotation File for %s\n", app->current_svg_name);
+    fprintf(f, "# YOLO Extended Annotation File for %s\n", app->current_svg_name);
     fprintf(f, "image: \"%s\"\n", app->current_svg_name);
     fprintf(f, "image_width: %.2f\n", app->svg.width);
     fprintf(f, "image_height: %.2f\n\n", app->svg.height);
@@ -318,10 +371,18 @@ static bool save_yolo_annotations(AppState* app, const char* yaml_path) {
         fprintf(f, "  - id: %d\n", i);
         fprintf(f, "    class_id: %d\n", a->class_id);
         fprintf(f, "    class_name: \"%s\"\n", a->class_name);
-        fprintf(f, "    # [x_center, y_center, width, height] (normalized)\n");
         fprintf(f, "    bbox: [%.6f, %.6f, %.6f, %.6f]\n", a->x_center, a->y_center, a->width, a->height);
-        fprintf(f, "    # Absolute canvas pixels: [x, y, w, h]\n");
-        fprintf(f, "    rect: [%.2f, %.2f, %.2f, %.2f]\n\n", a->x, a->y, a->w, a->h);
+        fprintf(f, "    rect: [%.2f, %.2f, %.2f, %.2f]\n", a->x, a->y, a->w, a->h);
+
+        // Extended urllink fields
+        if (strlen(a->url) > 0) {
+            fprintf(f, "    url: \"%s\"\n", a->url);
+        }
+        if (a->has_dest_viewport) {
+            fprintf(f, "    destination_viewport_bbox: [%.2f, %.2f, %.2f, %.2f]\n",
+                    a->dest_viewport[0], a->dest_viewport[1], a->dest_viewport[2], a->dest_viewport[3]);
+        }
+        fprintf(f, "\n");
     }
 
     fclose(f);
@@ -376,8 +437,36 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
             } else if (strncmp(p, "bbox:", 5) == 0) {
                 char* b_start = strchr(p, '[');
                 if (b_start) {
-                    sscanf(b_start, "[%f, %f, %f, %f]", 
+                    sscanf(b_start, "[%f, %f, %f, %f]",
                            &current.x_center, &current.y_center, &current.width, &current.height);
+                }
+            } else if (strncmp(p, "url:", 4) == 0) {
+                char* q1 = strchr(p, '\"');
+                char* q2 = q1 ? strchr(q1 + 1, '\"') : NULL;
+                if (q1 && q2) {
+                    size_t ulen = q2 - (q1 + 1);
+                    if (ulen < sizeof(current.url)) {
+                        strncpy(current.url, q1 + 1, ulen);
+                        current.url[ulen] = '\0';
+                    }
+                } else {
+                    char* ustart = p + 4;
+                    while (*ustart && isspace((unsigned char)*ustart)) ustart++;
+                    size_t ulen = strlen(ustart);
+                    while (ulen > 0 && isspace((unsigned char)ustart[ulen - 1])) ulen--;
+                    if (ulen < sizeof(current.url)) {
+                        strncpy(current.url, ustart, ulen);
+                        current.url[ulen] = '\0';
+                    }
+                }
+            } else if (strncmp(p, "destination_viewport_bbox:", 26) == 0) {
+                char* b_start = strchr(p, '[');
+                if (b_start) {
+                    if (sscanf(b_start, "[%f, %f, %f, %f]",
+                               &current.dest_viewport[0], &current.dest_viewport[1],
+                               &current.dest_viewport[2], &current.dest_viewport[3]) == 4) {
+                        current.has_dest_viewport = true;
+                    }
                 }
             }
         }
@@ -394,31 +483,75 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
     return true;
 }
 
-// --- Hit Testing & Handles ---
+// --- Launch URL Link (Thing C) ---
+
+static void launch_urllink(const YoloAnnotation* a) {
+    if (!a || strlen(a->url) == 0) return;
+
+    log_append("[LINK] Launching URL: %s", a->url);
+
+    if (_strnicmp(a->url, "http://", 7) == 0 || _strnicmp(a->url, "https://", 8) == 0) {
+        ShellExecuteA(NULL, "open", a->url, NULL, NULL, SW_SHOWNORMAL);
+        return;
+    }
+
+    char target_file[MAX_PATH];
+    const char* url_str = a->url;
+    if (_strnicmp(url_str, "file:///", 8) == 0) {
+        url_str += 8;
+    } else if (_strnicmp(url_str, "file://", 7) == 0) {
+        url_str += 7;
+    }
+    strncpy(target_file, url_str, MAX_PATH - 1);
+    for (char* p = target_file; *p; ++p) {
+        if (*p == '/') *p = '\\';
+    }
+
+    const char* ext = PathFindExtensionA(target_file);
+    if (_stricmp(ext, ".svg") == 0) {
+        char exe_path[MAX_PATH];
+        GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+
+        char cmd_line[1024];
+        if (a->has_dest_viewport) {
+            snprintf(cmd_line, sizeof(cmd_line), "\"%s\" \"%s\" --bbox %g %g %g %g",
+                     exe_path, target_file,
+                     a->dest_viewport[0], a->dest_viewport[1],
+                     a->dest_viewport[2], a->dest_viewport[3]);
+        } else {
+            snprintf(cmd_line, sizeof(cmd_line), "\"%s\" \"%s\"", exe_path, target_file);
+        }
+
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {0};
+        if (CreateProcessA(NULL, cmd_line, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            log_append("[LINK] Launched new viewer instance: %s", cmd_line);
+        } else {
+            log_append("[LINK] Error launching process: %s", cmd_line);
+        }
+    } else {
+        ShellExecuteA(NULL, "open", target_file, NULL, NULL, SW_SHOWNORMAL);
+    }
+}
+
+// --- Hit Testing ---
 
 static ResizeHandle hit_test_handles(AppState* app, const YoloAnnotation* a, float cx, float cy) {
     float handle_size = 12.0f / app->zoom;
     float hs2 = handle_size / 2.0f;
 
-    // Check corners
-    if (cx >= a->x - hs2 && cx <= a->x + hs2 && cy >= a->y - hs2 && cy <= a->y + hs2)
-        return HANDLE_TOP_LEFT;
-    if (cx >= a->x + a->w - hs2 && cx <= a->x + a->w + hs2 && cy >= a->y - hs2 && cy <= a->y + hs2)
-        return HANDLE_TOP_RIGHT;
-    if (cx >= a->x - hs2 && cx <= a->x + hs2 && cy >= a->y + a->h - hs2 && cy <= a->y + a->h + hs2)
-        return HANDLE_BOTTOM_LEFT;
-    if (cx >= a->x + a->w - hs2 && cx <= a->x + a->w + hs2 && cy >= a->y + a->h - hs2 && cy <= a->y + a->h + hs2)
-        return HANDLE_BOTTOM_RIGHT;
+    if (cx >= a->x - hs2 && cx <= a->x + hs2 && cy >= a->y - hs2 && cy <= a->y + hs2) return HANDLE_TOP_LEFT;
+    if (cx >= a->x + a->w - hs2 && cx <= a->x + a->w + hs2 && cy >= a->y - hs2 && cy <= a->y + hs2) return HANDLE_TOP_RIGHT;
+    if (cx >= a->x - hs2 && cx <= a->x + hs2 && cy >= a->y + a->h - hs2 && cy <= a->y + a->h + hs2) return HANDLE_BOTTOM_LEFT;
+    if (cx >= a->x + a->w - hs2 && cx <= a->x + a->w + hs2 && cy >= a->y + a->h - hs2 && cy <= a->y + a->h + hs2) return HANDLE_BOTTOM_RIGHT;
 
-    // Check body
-    if (cx >= a->x && cx <= a->x + a->w && cy >= a->y && cy <= a->y + a->h)
-        return HANDLE_BODY;
-
+    if (cx >= a->x && cx <= a->x + a->w && cy >= a->y && cy <= a->y + a->h) return HANDLE_BODY;
     return HANDLE_NONE;
 }
 
 static int hit_test_annotations(AppState* app, float cx, float cy, ResizeHandle* out_handle) {
-    // Check selected annotation first for handle priority
     if (app->selected_annotation_idx >= 0 && app->selected_annotation_idx < app->annotation_count) {
         ResizeHandle h = hit_test_handles(app, &app->annotations[app->selected_annotation_idx], cx, cy);
         if (h != HANDLE_NONE) {
@@ -427,7 +560,6 @@ static int hit_test_annotations(AppState* app, float cx, float cy, ResizeHandle*
         }
     }
 
-    // Check in reverse order (top to bottom)
     for (int i = app->annotation_count - 1; i >= 0; --i) {
         ResizeHandle h = hit_test_handles(app, &app->annotations[i], cx, cy);
         if (h != HANDLE_NONE) {
@@ -979,7 +1111,6 @@ static void load_svg_file(AppState* app, const char* path) {
     FontHelper_GetFontName(path, app->current_svg_name, sizeof(app->current_svg_name));
     app->has_svg_loaded = true;
 
-    // Auto-load corresponding A-yoloAnnot.yaml
     char yml_path[MAX_PATH];
     get_default_annot_path(path, yml_path, sizeof(yml_path));
     if (GetFileAttributesA(yml_path) != INVALID_FILE_ATTRIBUTES) {
@@ -1019,7 +1150,6 @@ static void svg_path_traverse_cb(void* closure, plutovg_path_command_t command, 
     }
 }
 
-// --- Export SVG with Glyphs Converted to Vector Paths ---
 static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) {
     if (!app->has_svg_loaded) return false;
 
@@ -1181,7 +1311,7 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_restore(canvas);
 }
 
-// --- Render Semi-Transparent YOLO Annotation Masks ---
+// --- Render Semi-Transparent YOLO Annotations (Thing A: System Monospace Font) ---
 static void draw_annotations(AppState* app) {
     if (!app->canvas) return;
 
@@ -1196,7 +1326,7 @@ static void draw_annotations(AppState* app) {
 
         plutovg_canvas_save(app->canvas);
 
-        // 1. Semi-transparent fill mask (35% opacity normally, 50% if selected)
+        // 1. Semi-transparent mask fill (35% normally, 50% if selected)
         plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, is_sel ? 0.50f : 0.35f);
         plutovg_canvas_fill_rect(app->canvas, a->x, a->y, a->w, a->h);
 
@@ -1205,25 +1335,33 @@ static void draw_annotations(AppState* app) {
         plutovg_canvas_set_line_width(app->canvas, is_sel ? 2.5f / app->zoom : 1.5f / app->zoom);
         plutovg_canvas_stroke_rect(app->canvas, a->x, a->y, a->w, a->h);
 
-        // 3. Label Badge on top-left of box
-        if (app->registry.fallback_face) {
+        // 3. Label Badge strictly using System Monospace Font (Thing A)
+        if (app->system_mono_face) {
             float badge_h = 16.0f / app->zoom;
             float font_sz = 11.0f / app->zoom;
 
-            plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, 0.95f);
-            plutovg_canvas_fill_rect(app->canvas, a->x, a->y - badge_h, a->w > 80.0f ? 80.0f : a->w, badge_h);
+            char badge[128];
+            if (a->class_id == 8 && strlen(a->url) > 0) {
+                snprintf(badge, sizeof(badge), "[LINK] %s", PathFindFileNameA(a->url));
+            } else {
+                snprintf(badge, sizeof(badge), "[%d] %s", a->class_id, a->class_name);
+            }
 
-            plutovg_canvas_set_font_face(app->canvas, app->registry.fallback_face);
+            float badge_w = (float)(strlen(badge) * 7.0f) / app->zoom + 6.0f / app->zoom;
+            if (badge_w < 60.0f / app->zoom) badge_w = 60.0f / app->zoom;
+
+            plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, 0.95f);
+            plutovg_canvas_fill_rect(app->canvas, a->x, a->y - badge_h, badge_w, badge_h);
+
+            plutovg_canvas_set_font_face(app->canvas, app->system_mono_face);
             plutovg_canvas_set_font_size(app->canvas, font_sz);
             plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
-
-            char badge[64];
-            snprintf(badge, sizeof(badge), "[%d] %s", a->class_id, a->class_name);
-            plutovg_canvas_fill_text(app->canvas, badge, -1, PLUTOVG_TEXT_ENCODING_UTF8, a->x + 2.0f / app->zoom, a->y - 3.0f / app->zoom);
+            plutovg_canvas_fill_text(app->canvas, badge, -1, PLUTOVG_TEXT_ENCODING_UTF8,
+                                    a->x + 3.0f / app->zoom, a->y - 3.5f / app->zoom);
         }
 
         // 4. Resize corner handles if selected
-        if (is_sel) {
+        if (is_sel && app->annotations_selectable) {
             float hs = 8.0f / app->zoom;
             float hs2 = hs / 2.0f;
             plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
@@ -1243,7 +1381,6 @@ static void draw_annotations(AppState* app) {
         plutovg_canvas_restore(app->canvas);
     }
 
-    // Draw live drag box preview
     if (app->is_drawing_box) {
         float x1 = app->drag_start_canvas_x;
         float y1 = app->drag_start_canvas_y;
@@ -1324,7 +1461,6 @@ static void render(AppState* app) {
             plutovg_canvas_restore(app->canvas);
         }
 
-        // Draw YOLO Annotations overlay
         draw_annotations(app);
     }
 
@@ -1368,6 +1504,149 @@ static bool browse_file(HWND parent, const char* filter, char* out_path, size_t 
     return false;
 }
 
+// --- URL Link Editing Dialog Procedure (Thing C) ---
+static LRESULT CALLBACK UrlLinkDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static YoloAnnotation* s_annot = NULL;
+
+    switch (msg) {
+    case WM_INITDIALOG:
+    case WM_CREATE: {
+        s_annot = (YoloAnnotation*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+        break;
+    }
+    case WM_COMMAND: {
+        switch (LOWORD(wParam)) {
+        case IDC_DLG_BTN_BROWSE: {
+            char path[MAX_PATH];
+            if (browse_file(hwnd, "SVG / All Files (*.svg;*.*)\0*.svg;*.*\0", path, sizeof(path), false, "svg")) {
+                char file_url[MAX_PATH + 16];
+                snprintf(file_url, sizeof(file_url), "file://%s", path);
+                SetDlgItemTextA(hwnd, IDC_DLG_URL_EDIT, file_url);
+            }
+            break;
+        }
+        case IDC_DLG_BTN_CAPTURE: {
+            float cx1, cy1, cx2, cy2;
+            screen_to_canvas(&g_app, 0, 0, &cx1, &cy1);
+            screen_to_canvas(&g_app, (float)g_app.width, (float)g_app.height, &cx2, &cy2);
+            float bx = cx1 < cx2 ? cx1 : cx2;
+            float by = cy1 < cy2 ? cy1 : cy2;
+            float bw = fabsf(cx2 - cx1);
+            float bh = fabsf(cy2 - cy1);
+
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%.2f %.2f %.2f %.2f", bx, by, bw, bh);
+            SetDlgItemTextA(hwnd, IDC_DLG_VIEWPORT_EDIT, buf);
+            break;
+        }
+        case IDC_DLG_BTN_OK: {
+            s_annot = (YoloAnnotation*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+            if (s_annot) {
+                GetDlgItemTextA(hwnd, IDC_DLG_URL_EDIT, s_annot->url, sizeof(s_annot->url));
+                s_annot->class_id = 8;
+                strncpy(s_annot->class_name, "urllink", sizeof(s_annot->class_name) - 1);
+
+                char vp_text[128] = {0};
+                GetDlgItemTextA(hwnd, IDC_DLG_VIEWPORT_EDIT, vp_text, sizeof(vp_text));
+                for (char* p = vp_text; *p; ++p) if (*p == ',' || *p == '[' || *p == ']') *p = ' ';
+
+                float vx, vy, vw, vh;
+                if (sscanf(vp_text, "%f %f %f %f", &vx, &vy, &vw, &vh) == 4) {
+                    s_annot->dest_viewport[0] = vx;
+                    s_annot->dest_viewport[1] = vy;
+                    s_annot->dest_viewport[2] = vw;
+                    s_annot->dest_viewport[3] = vh;
+                    s_annot->has_dest_viewport = true;
+                } else {
+                    s_annot->has_dest_viewport = false;
+                }
+                log_append("[ANNOT] Configured URLLink: url='%s', viewport=%s",
+                           s_annot->url, s_annot->has_dest_viewport ? vp_text : "(scale to fit)");
+            }
+            DestroyWindow(hwnd);
+            InvalidateRect(g_app.hwnd_main, NULL, FALSE);
+            break;
+        }
+        case IDC_DLG_BTN_CANCEL:
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void open_urllink_dialog(HWND parent, YoloAnnotation* a) {
+    if (!a) return;
+
+    static bool s_registered = false;
+    if (!s_registered) {
+        WNDCLASSEXA wc = { sizeof(wc) };
+        wc.lpfnWndProc = UrlLinkDlgProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "PlutoVGUrlLinkDlgClass";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        RegisterClassExA(&wc);
+        s_registered = true;
+    }
+
+    HWND hwnd_dlg = CreateWindowExA(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        "PlutoVGUrlLinkDlgClass",
+        "Edit URL Link Annotation",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 520, 260,
+        parent, NULL, GetModuleHandle(NULL), NULL
+    );
+
+    SetWindowLongPtr(hwnd_dlg, GWLP_USERDATA, (LONG_PTR)a);
+
+    // Dialog Child Controls
+    CreateWindowA("STATIC", "Target URL (e.g. file://c:/example.svg or https://...):",
+                  WS_CHILD | WS_VISIBLE, 20, 16, 460, 18, hwnd_dlg, NULL, NULL, NULL);
+
+    HWND hUrlEdit = CreateWindowA("EDIT", a->url, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                  20, 38, 360, 24, hwnd_dlg, (HMENU)IDC_DLG_URL_EDIT, NULL, NULL);
+
+    CreateWindowA("BUTTON", "Browse...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                  390, 38, 90, 24, hwnd_dlg, (HMENU)IDC_DLG_BTN_BROWSE, NULL, NULL);
+
+    CreateWindowA("STATIC", "Destination Viewport BBox [x y w h] (Optional):",
+                  WS_CHILD | WS_VISIBLE, 20, 78, 460, 18, hwnd_dlg, NULL, NULL, NULL);
+
+    char vp_str[128] = "";
+    if (a->has_dest_viewport) {
+        snprintf(vp_str, sizeof(vp_str), "%.2f %.2f %.2f %.2f",
+                 a->dest_viewport[0], a->dest_viewport[1], a->dest_viewport[2], a->dest_viewport[3]);
+    }
+    HWND hVpEdit = CreateWindowA("EDIT", vp_str, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                 20, 100, 280, 24, hwnd_dlg, (HMENU)IDC_DLG_VIEWPORT_EDIT, NULL, NULL);
+
+    CreateWindowA("BUTTON", "Capture Current View", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                  310, 100, 170, 24, hwnd_dlg, (HMENU)IDC_DLG_BTN_CAPTURE, NULL, NULL);
+
+    CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                  290, 165, 90, 28, hwnd_dlg, (HMENU)IDC_DLG_BTN_OK, NULL, NULL);
+    CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                  390, 165, 90, 28, hwnd_dlg, (HMENU)IDC_DLG_BTN_CANCEL, NULL, NULL);
+
+    HFONT hSysFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    SendMessageA(hUrlEdit, WM_SETFONT, (WPARAM)hSysFont, TRUE);
+    SendMessageA(hVpEdit, WM_SETFONT, (WPARAM)hSysFont, TRUE);
+
+    RECT prc, drc;
+    GetWindowRect(parent, &prc);
+    GetWindowRect(hwnd_dlg, &drc);
+    int x = prc.left + (prc.right - prc.left - (drc.right - drc.left)) / 2;
+    int y = prc.top + (prc.bottom - prc.top - (drc.bottom - drc.top)) / 2;
+    SetWindowPos(hwnd_dlg, HWND_TOP, x, y, 0, 0, SWP_NOSIZE);
+}
+
 // Log Window Procedure
 static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -1390,8 +1669,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_app.show_grid = true;
         g_app.zoom = 1.0f;
         g_app.interaction_mode = APP_MODE_NAVIGATE;
+        g_app.annotations_selectable = true; // Thing B: Selectable by default
         g_app.active_class_id = 0;
         g_app.selected_annotation_idx = -1;
+        load_system_mono_font(&g_app); // Thing A
         return 0;
     }
 
@@ -1428,15 +1709,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         SetCapture(hwnd);
 
-        if (g_app.interaction_mode == APP_MODE_ANNOTATE) {
-            // Start drawing a new bounding box
+        if (g_app.interaction_mode == APP_MODE_ANNOTATE && g_app.annotations_selectable) {
             g_app.is_drawing_box = true;
             g_app.drag_start_canvas_x = cx;
             g_app.drag_start_canvas_y = cy;
             g_app.drag_curr_canvas_x = cx;
             g_app.drag_curr_canvas_y = cy;
-        } else {
-            // Navigate/Select Mode: Hit test annotations and handles
+        } else if (g_app.annotations_selectable) {
+            // Thing B: Check handles / boxes only if annotations_selectable is true
             ResizeHandle handle = HANDLE_NONE;
             int hit = hit_test_annotations(&g_app, cx, cy, &handle);
 
@@ -1447,12 +1727,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_app.drag_start_canvas_x = cx;
                 g_app.drag_start_canvas_y = cy;
             } else {
-                // Pan Canvas
                 g_app.selected_annotation_idx = -1;
                 g_app.is_dragging_view = true;
                 g_app.last_mouse.x = mx;
                 g_app.last_mouse.y = my;
             }
+        } else {
+            // Annotations Locked / Non-selectable -> Panning Only (Thing B)
+            g_app.selected_annotation_idx = -1;
+            g_app.is_dragging_view = true;
+            g_app.last_mouse.x = mx;
+            g_app.last_mouse.y = my;
         }
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
@@ -1510,13 +1795,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             if (bw > 4.0f && bh > 4.0f && g_app.annotation_count < MAX_ANNOTATIONS) {
                 YoloAnnotation* a = &g_app.annotations[g_app.annotation_count++];
+                memset(a, 0, sizeof(YoloAnnotation));
                 a->id = g_app.annotation_count - 1;
                 a->class_id = g_app.active_class_id;
                 strncpy(a->class_name, DEFAULT_CATEGORIES[g_app.active_class_id].name, sizeof(a->class_name) - 1);
                 update_annotation_normalized(&g_app, a, x1 < x2 ? x1 : x2, y1 < y2 ? y1 : y2, bw, bh);
                 g_app.selected_annotation_idx = g_app.annotation_count - 1;
-                log_append("[ANNOT] Added box #%d: [%.3f, %.3f, %.3f, %.3f] (class: %s)",
-                           a->id, a->x_center, a->y_center, a->width, a->height, a->class_name);
+
+                if (a->class_id == 8) {
+                    open_urllink_dialog(hwnd, a);
+                } else {
+                    log_append("[ANNOT] Added box #%d: [%.3f, %.3f, %.3f, %.3f] (class: %s)",
+                               a->id, a->x_center, a->y_center, a->width, a->height, a->class_name);
+                }
             }
         }
         g_app.is_transforming_box = false;
@@ -1527,8 +1818,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_LBUTTONDBLCLK: { // Double Click Launch / Edit (Thing C)
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        float cx, cy;
+        screen_to_canvas(&g_app, (float)mx, (float)my, &cx, &cy);
+
+        ResizeHandle handle = HANDLE_NONE;
+        int hit = hit_test_annotations(&g_app, cx, cy, &handle);
+        if (hit >= 0) {
+            g_app.selected_annotation_idx = hit;
+            YoloAnnotation* a = &g_app.annotations[hit];
+
+            if (a->class_id == 8 || _stricmp(a->class_name, "urllink") == 0 || strlen(a->url) > 0) {
+                bool shift_or_ctrl = (GetKeyState(VK_SHIFT) & 0x8000) || (GetKeyState(VK_CONTROL) & 0x8000);
+                if (shift_or_ctrl || strlen(a->url) == 0) {
+                    open_urllink_dialog(hwnd, a);
+                } else {
+                    launch_urllink(a);
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        return 0;
+    }
+
     case WM_RBUTTONDOWN: {
-        // Right-drag always pans
         g_app.is_dragging_view = true;
         g_app.last_mouse.x = GET_X_LPARAM(lParam);
         g_app.last_mouse.y = GET_Y_LPARAM(lParam);
@@ -1562,12 +1878,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_SVG, 0);
             else SendMessage(hwnd, WM_COMMAND, ID_MENU_OPEN_FONT, 0);
             break;
+        case 'K':
+            if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_EDIT_URLLINK, 0);
+            break;
         case 'E':
             if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_EXPORT_SVG, 0);
             break;
         case 'N':
         case VK_TAB:
             SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_MODE, 0);
+            break;
+        case VK_F2:
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_SELECTABLE, 0);
             break;
         case 'C':
             SendMessage(hwnd, WM_COMMAND, ID_MENU_CYCLE_CLASS, 0);
@@ -1577,7 +1899,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessage(hwnd, WM_COMMAND, ID_MENU_DELETE_ANNOT, 0);
             break;
         case '1': case '2': case '3': case '4':
-        case '5': case '6': case '7': case '8':
+        case '5': case '6': case '7': case '8': case '9':
             SendMessage(hwnd, WM_COMMAND, ID_MENU_CLASS_BASE + (int)(wParam - '1'), 0);
             break;
         case 'L': SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_LOG, 0); break;
@@ -1661,9 +1983,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case ID_MENU_TOGGLE_MODE: {
             g_app.interaction_mode = (g_app.interaction_mode == APP_MODE_NAVIGATE) ? APP_MODE_ANNOTATE : APP_MODE_NAVIGATE;
             CheckMenuItem(GetMenu(hwnd), ID_MENU_TOGGLE_MODE, (g_app.interaction_mode == APP_MODE_ANNOTATE) ? MF_CHECKED : MF_UNCHECKED);
-            log_append("[MODE] Switched to %s Mode (Tab/N to toggle)", 
+            log_append("[MODE] Switched to %s Mode (Tab/N to toggle)",
                        (g_app.interaction_mode == APP_MODE_ANNOTATE) ? "DRAW ANNOTATION BOX" : "NAVIGATE / SELECT");
             InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        }
+        case ID_MENU_TOGGLE_SELECTABLE: { // Thing B
+            g_app.annotations_selectable = !g_app.annotations_selectable;
+            CheckMenuItem(GetMenu(hwnd), ID_MENU_TOGGLE_SELECTABLE, g_app.annotations_selectable ? MF_CHECKED : MF_UNCHECKED);
+            if (!g_app.annotations_selectable) {
+                g_app.selected_annotation_idx = -1;
+            }
+            log_append("[MODE] Annotations Selectable: %s (When OFF, pointer device will only Pan)",
+                       g_app.annotations_selectable ? "ON" : "OFF");
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        }
+        case ID_MENU_EDIT_URLLINK: { // Thing C
+            if (g_app.selected_annotation_idx >= 0 && g_app.selected_annotation_idx < g_app.annotation_count) {
+                open_urllink_dialog(hwnd, &g_app.annotations[g_app.selected_annotation_idx]);
+            } else {
+                MessageBoxA(hwnd, "Please select an annotation box first.", "Edit URL Link", MB_ICONINFORMATION);
+            }
             break;
         }
         case ID_MENU_DELETE_ANNOT: {
@@ -1758,6 +2099,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         free_svg_doc(&g_app.svg);
         registry_init(&g_app.registry);
+        if (g_app.system_mono_face) plutovg_font_face_destroy(g_app.system_mono_face);
         if (g_app.hfont_log) DeleteObject(g_app.hfont_log);
         if (g_app.canvas) plutovg_canvas_destroy(g_app.canvas);
         if (g_app.surface) plutovg_surface_destroy(g_app.surface);
@@ -1788,6 +2130,8 @@ static void create_app_menu(HWND hwnd) {
 
     // Edit Menu
     AppendMenuA(hEditMenu, MF_STRING | MF_UNCHECKED, ID_MENU_TOGGLE_MODE, "&Draw Box Mode\t(Tab / N)");
+    AppendMenuA(hEditMenu, MF_STRING | MF_CHECKED, ID_MENU_TOGGLE_SELECTABLE, "Annotations &Selectable\t(F2)");
+    AppendMenuA(hEditMenu, MF_STRING, ID_MENU_EDIT_URLLINK, "&Edit URL Link...\t(Ctrl+K)");
     AppendMenuA(hEditMenu, MF_STRING, ID_MENU_DELETE_ANNOT, "&Delete Selected Box\t(Del)");
     AppendMenuA(hEditMenu, MF_STRING, ID_MENU_CLEAR_ANNOT, "&Clear All Annotations");
     AppendMenuA(hEditMenu, MF_SEPARATOR, 0, NULL);
@@ -1828,7 +2172,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     WNDCLASSEXA wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXA);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS; // Enabled double clicks
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -1890,14 +2234,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     create_app_menu(g_app.hwnd_main);
 
-    // Accelerator Table
+    // Accelerators
     ACCEL accels[] = {
         { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
         { FCONTROL | FVIRTKEY, 'S', ID_MENU_SAVE_ANNOT },
         { FCONTROL | FVIRTKEY, 'E', ID_MENU_EXPORT_SVG },
+        { FCONTROL | FVIRTKEY, 'K', ID_MENU_EDIT_URLLINK },
         { FVIRTKEY, 'O', ID_MENU_OPEN_FONT },
         { FVIRTKEY, 'N', ID_MENU_TOGGLE_MODE },
         { FVIRTKEY, VK_TAB, ID_MENU_TOGGLE_MODE },
+        { FVIRTKEY, VK_F2, ID_MENU_TOGGLE_SELECTABLE },
         { FVIRTKEY, 'C', ID_MENU_CYCLE_CLASS },
         { FVIRTKEY, VK_DELETE, ID_MENU_DELETE_ANNOT },
         { FVIRTKEY, VK_BACK, ID_MENU_DELETE_ANNOT },
@@ -1914,15 +2260,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(g_app.hwnd_main, nCmdShow);
     UpdateWindow(g_app.hwnd_main);
 
+    // Command line handling including --bbox target viewport
     int argc = 0;
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argvW && argc > 1) {
-        char initial_path[MAX_PATH];
+        char initial_path[MAX_PATH] = {0};
         WideCharToMultiByte(CP_UTF8, 0, argvW[1], -1, initial_path, MAX_PATH, NULL, NULL);
+
+        float target_bbox[4] = {0};
+        bool has_target_bbox = false;
+
+        for (int i = 2; i < argc; ++i) {
+            char arg[MAX_PATH];
+            WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, arg, MAX_PATH, NULL, NULL);
+            if ((_stricmp(arg, "--bbox") == 0 || _stricmp(arg, "-bbox") == 0) && i + 4 < argc) {
+                char a1[64], a2[64], a3[64], a4[64];
+                WideCharToMultiByte(CP_UTF8, 0, argvW[i+1], -1, a1, sizeof(a1), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, argvW[i+2], -1, a2, sizeof(a2), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, argvW[i+3], -1, a3, sizeof(a3), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, argvW[i+4], -1, a4, sizeof(a4), NULL, NULL);
+                target_bbox[0] = (float)atof(a1);
+                target_bbox[1] = (float)atof(a2);
+                target_bbox[2] = (float)atof(a3);
+                target_bbox[3] = (float)atof(a4);
+                has_target_bbox = true;
+                break;
+            }
+        }
 
         const char* ext = PathFindExtensionA(initial_path);
         if (_stricmp(ext, ".svg") == 0) {
             load_svg_file(&g_app, initial_path);
+            if (has_target_bbox) {
+                focus_viewport_bbox(&g_app, target_bbox[0], target_bbox[1], target_bbox[2], target_bbox[3]);
+            }
         }
         LocalFree(argvW);
         InvalidateRect(g_app.hwnd_main, NULL, FALSE);
