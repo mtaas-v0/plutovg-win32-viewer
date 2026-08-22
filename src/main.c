@@ -45,15 +45,16 @@
 #define IDC_DLG_BTN_OK            3005
 #define IDC_DLG_BTN_CANCEL        3006
 
-// Viewport Picker Dialog Controls
+// Viewport Picker Controls
 #define IDC_VP_APPLY_BOX          4001
 #define IDC_VP_APPLY_VIEW         4002
 #define IDC_VP_CANCEL             4003
 
 #define MAX_FONTS                 64
-#define MAX_SVG_NODES             8192
+#define MAX_SVG_NODES             16384
 #define MAX_ANNOTATIONS           512
 #define MAX_CATEGORIES            9
+#define MAX_GROUP_DEPTH           32
 
 typedef enum {
     APP_MODE_NAVIGATE,
@@ -84,7 +85,7 @@ static const AnnotationCategory DEFAULT_CATEGORIES[MAX_CATEGORIES] = {
     { 5, "matrix",   0.10f, 0.80f, 0.85f }, // Cyan
     { 6, "script",   0.95f, 0.85f, 0.15f }, // Yellow
     { 7, "diagram",  0.95f, 0.30f, 0.65f }, // Pink
-    { 8, "urllink",  0.05f, 0.85f, 0.80f }  // Teal (URL link)
+    { 8, "urllink",  0.05f, 0.85f, 0.80f }  // Teal
 };
 
 // --- Extended YOLO Annotation Structure ---
@@ -93,19 +94,16 @@ typedef struct {
     int class_id;
     char class_name[32];
 
-    // Normalized YOLO format [0..1]: [x_center, y_center, width, height]
     float x_center;
     float y_center;
     float width;
     float height;
 
-    // Absolute canvas coords [x, y, w, h]
     float x, y, w, h;
 
-    // URL Link Extension
     char url[512];
     bool has_dest_viewport;
-    float dest_viewport[4]; // [x, y, w, h]
+    float dest_viewport[4];
 } YoloAnnotation;
 
 // --- Font Lookup Registry ---
@@ -160,19 +158,29 @@ typedef struct {
 } SvgDocument;
 
 typedef struct {
+    plutovg_matrix_t matrix;
+    bool has_stroke;
+    plutovg_color_t stroke_color;
+    bool has_stroke_width;
+    float stroke_width;
+    bool has_fill;
+    plutovg_color_t fill_color;
+    bool has_fill_rule;
+    plutovg_fill_rule_t fill_rule;
+} SvgGroupState;
+
+typedef struct {
     HWND hwnd_main;
     HWND hwnd_log;
     HWND hwnd_log_edit;
     HFONT hfont_log;
 
-    // Viewport
     float zoom;
     float pan_x;
     float pan_y;
     float rotation_deg;
     float shear_x;
 
-    // Mouse Interaction
     bool is_dragging_view;
     bool is_drawing_box;
     bool is_transforming_box;
@@ -183,23 +191,20 @@ typedef struct {
     float drag_curr_canvas_x;
     float drag_curr_canvas_y;
 
-    // Annotation Data & Settings
     AppInteractionMode interaction_mode;
     bool annotations_selectable;
-    bool is_dirty; // Problem b: Tracks unsaved changes
+    bool is_dirty;
     YoloAnnotation annotations[MAX_ANNOTATIONS];
     int annotation_count;
     int selected_annotation_idx;
     int active_class_id;
     char annot_file_path[MAX_PATH];
 
-    // Canvas Surface
     int width;
     int height;
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
 
-    // Fonts & SVG
     char current_svg_path[MAX_PATH];
     char current_svg_name[128];
     char fonts_dir[MAX_PATH];
@@ -208,7 +213,6 @@ typedef struct {
     bool has_svg_loaded;
     bool show_grid;
 
-    // Monospace UI Font
     plutovg_font_face_t* system_mono_face;
 } AppState;
 
@@ -282,7 +286,7 @@ static void toggle_log_window(void) {
     CheckMenuItem(GetMenu(g_app.hwnd_main), ID_MENU_TOGGLE_LOG, !is_visible ? MF_CHECKED : MF_UNCHECKED);
 }
 
-// --- Window Title & Dirty Check (Problem b) ---
+// --- Window Title & Dirty Check ---
 
 static void update_window_title(void) {
     char title[512];
@@ -830,7 +834,7 @@ static void discover_fonts_for_svg(FontRegistry* reg, char* out_fonts_dir, size_
     }
 }
 
-// --- Attribute & CSS Style Locator (Problem a Fix) ---
+// --- Attribute & CSS Style Locator ---
 
 static const char* find_attr_slice(const char* tag_start, const char* tag_end, const char* attr_name, size_t* out_len) {
     if (!tag_start || !tag_end || tag_start >= tag_end || !attr_name) return NULL;
@@ -862,11 +866,9 @@ static const char* find_attr_slice(const char* tag_start, const char* tag_end, c
     return NULL;
 }
 
-// Finds property from direct XML attribute OR inside style="..."
 static const char* find_prop_slice(const char* tag_start, const char* tag_end, const char* prop_name, size_t* out_len) {
     if (!tag_start || !tag_end || tag_start >= tag_end || !prop_name) return NULL;
 
-    // 1. Direct attribute: prop="val"
     size_t direct_len = 0;
     const char* direct_val = find_attr_slice(tag_start, tag_end, prop_name, &direct_len);
     if (direct_val && direct_len > 0) {
@@ -874,7 +876,6 @@ static const char* find_prop_slice(const char* tag_start, const char* tag_end, c
         return direct_val;
     }
 
-    // 2. CSS inline style: style="...; prop: val; ..."
     size_t style_len = 0;
     const char* style_str = find_attr_slice(tag_start, tag_end, "style", &style_len);
     if (style_str && style_len > 0) {
@@ -981,22 +982,85 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
     }
 }
 
+// Full Hex / RGB / Name Color Parser
 static void parse_color_slice(const char* val, size_t len, bool* has_paint, plutovg_color_t* color, plutovg_color_t default_color) {
     if (!val || len == 0) { *has_paint = false; return; }
+
     char buf[64];
     if (len >= sizeof(buf)) len = sizeof(buf) - 1;
     strncpy(buf, val, len);
     buf[len] = '\0';
 
-    if (_stricmp(buf, "none") == 0) { *has_paint = false; return; }
-    if (_stricmp(buf, "currentColor") == 0 || _stricmp(buf, "black") == 0) {
+    char* p = buf;
+    while (*p && isspace((unsigned char)*p)) p++;
+    size_t blen = strlen(p);
+    while (blen > 0 && isspace((unsigned char)p[blen - 1])) p[--blen] = '\0';
+
+    if (_stricmp(p, "none") == 0) {
+        *has_paint = false;
+        return;
+    }
+
+    if (p[0] == '#') {
+        p++;
+        blen--;
+        unsigned int r = 0, g = 0, b = 0, a = 255;
+        if (blen == 3) {
+            unsigned int rgb;
+            if (sscanf(p, "%3x", &rgb) == 1) {
+                r = ((rgb >> 8) & 0xF) * 17;
+                g = ((rgb >> 4) & 0xF) * 17;
+                b = (rgb & 0xF) * 17;
+                plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
+                *has_paint = true;
+                return;
+            }
+        } else if (blen == 6) {
+            if (sscanf(p, "%02x%02x%02x", &r, &g, &b) == 3) {
+                plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
+                *has_paint = true;
+                return;
+            }
+        } else if (blen == 8) {
+            if (sscanf(p, "%02x%02x%02x%02x", &r, &g, &b, &a) == 4) {
+                plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+                *has_paint = true;
+                return;
+            }
+        }
+    }
+
+    if (_stricmp(p, "currentColor") == 0 || _stricmp(p, "black") == 0) {
         *has_paint = true; plutovg_color_init_rgb(color, 0, 0, 0); return;
     }
-    if (_stricmp(buf, "white") == 0) {
+    if (_stricmp(p, "white") == 0) {
         *has_paint = true; plutovg_color_init_rgb(color, 1, 1, 1); return;
     }
-    if (plutovg_color_parse(color, buf, (int)len)) *has_paint = true;
-    else { *has_paint = true; *color = default_color; }
+    if (_stricmp(p, "red") == 0) {
+        *has_paint = true; plutovg_color_init_rgb(color, 1, 0, 0); return;
+    }
+    if (_stricmp(p, "green") == 0) {
+        *has_paint = true; plutovg_color_init_rgb(color, 0, 0.5f, 0); return;
+    }
+    if (_stricmp(p, "blue") == 0) {
+        *has_paint = true; plutovg_color_init_rgb(color, 0, 0, 1); return;
+    }
+    if (_stricmp(p, "yellow") == 0) {
+        *has_paint = true; plutovg_color_init_rgb(color, 1, 1, 0); return;
+    }
+    if (_stricmp(p, "cyan") == 0) {
+        *has_paint = true; plutovg_color_init_rgb(color, 0, 1, 1); return;
+    }
+    if (_stricmp(p, "magenta") == 0) {
+        *has_paint = true; plutovg_color_init_rgb(color, 1, 0, 1); return;
+    }
+
+    if (plutovg_color_parse(color, p, (int)blen)) {
+        *has_paint = true;
+    } else {
+        *has_paint = true;
+        *color = default_color;
+    }
 }
 
 static void free_svg_doc(SvgDocument* doc) {
@@ -1011,6 +1075,7 @@ static void free_svg_doc(SvgDocument* doc) {
     doc->text_count = 0;
 }
 
+// Parses <path>, <ellipse>, <circle>, <rect>, <line>, <polyline>, <polygon>, <g>, and <text>
 static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
     FILE* f = fopen(svg_path, "rb");
     if (!f) return;
@@ -1043,6 +1108,11 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
         }
     }
 
+    SvgGroupState group_stack[MAX_GROUP_DEPTH];
+    int group_depth = 0;
+    memset(&group_stack[0], 0, sizeof(SvgGroupState));
+    plutovg_matrix_init_identity(&group_stack[0].matrix);
+
     const char* cur = buffer;
     while (*cur && doc->node_count < MAX_SVG_NODES) {
         const char* tag_open = strchr(cur, '<');
@@ -1054,73 +1124,194 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             continue;
         }
 
-        // 1. <path ... />
-        if (strncmp(tag_open, "<path", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
+        // Group handling <g ...> and </g>
+        if (strncmp(tag_open, "</g", 3) == 0 && (isspace((unsigned char)tag_open[3]) || tag_open[3] == '>')) {
+            if (group_depth > 0) group_depth--;
             const char* tag_end = strchr(tag_open, '>');
-            if (!tag_end) { cur = tag_open + 5; continue; }
+            cur = tag_end ? tag_end + 1 : tag_open + 3;
+            continue;
+        }
 
-            size_t d_len = 0;
-            const char* d_str = find_prop_slice(tag_open, tag_end, "d", &d_len);
-            if (d_str && d_len > 0) {
-                SvgNode* node = &doc->nodes[doc->node_count++];
-                memset(node, 0, sizeof(SvgNode));
-                node->type = SVG_NODE_PATH;
-                node->path = plutovg_path_create();
-                node->fill_rule = PLUTOVG_FILL_RULE_NON_ZERO;
-
-                plutovg_path_parse(node->path, d_str, (int)d_len);
+        if (strncmp(tag_open, "<g", 2) == 0 && (isspace((unsigned char)tag_open[2]) || tag_open[2] == '>')) {
+            const char* tag_end = strchr(tag_open, '>');
+            if (tag_end && group_depth < MAX_GROUP_DEPTH - 1) {
+                SvgGroupState* parent = &group_stack[group_depth];
+                group_depth++;
+                SvgGroupState* g = &group_stack[group_depth];
+                *g = *parent;
 
                 size_t t_len = 0;
                 const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
-                if (t_str && t_len > 0) parse_svg_transform(t_str, t_len, &node->matrix);
-                else plutovg_matrix_init_identity(&node->matrix);
-
-                size_t fr_len = 0;
-                const char* fr_str = find_prop_slice(tag_open, tag_end, "fill-rule", &fr_len);
-                if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) {
-                    node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
+                if (t_str && t_len > 0) {
+                    plutovg_matrix_t g_mat;
+                    parse_svg_transform(t_str, t_len, &g_mat);
+                    plutovg_matrix_multiply(&g->matrix, &parent->matrix, &g_mat);
                 }
-
-                node->stroke_width = 1.0f;
-                node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
-                node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
 
                 size_t a_len = 0;
                 const char* a_str = NULL;
-                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-width", &a_len))) node->stroke_width = (float)atof(a_str);
-                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-linejoin", &a_len))) {
-                    if (a_len >= 5 && strncmp(a_str, "bevel", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_BEVEL;
-                    else if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_ROUND;
-                }
-                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-linecap", &a_len))) {
-                    if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_ROUND;
-                    else if (a_len >= 6 && strncmp(a_str, "square", 6) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_SQUARE;
-                }
-
                 plutovg_color_t black;
                 plutovg_color_init_rgb(&black, 0, 0, 0);
 
-                // Problem a Fix: Check stroke/fill from direct attribute or CSS style
-                const char* stroke_val = find_prop_slice(tag_open, tag_end, "stroke", &a_len);
-                if (stroke_val) {
-                    parse_color_slice(stroke_val, a_len, &node->has_stroke, &node->stroke_color, black);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke", &a_len))) {
+                    parse_color_slice(a_str, a_len, &g->has_stroke, &g->stroke_color, black);
+                }
+                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-width", &a_len))) {
+                    g->has_stroke_width = true;
+                    g->stroke_width = (float)atof(a_str);
+                }
+                if ((a_str = find_prop_slice(tag_open, tag_end, "fill", &a_len))) {
+                    parse_color_slice(a_str, a_len, &g->has_fill, &g->fill_color, black);
+                }
+                if ((a_str = find_prop_slice(tag_open, tag_end, "fill-rule", &a_len))) {
+                    g->has_fill_rule = true;
+                    g->fill_rule = (a_len >= 7 && strncmp(a_str, "evenodd", 7) == 0) ? PLUTOVG_FILL_RULE_EVEN_ODD : PLUTOVG_FILL_RULE_NON_ZERO;
                 }
 
-                const char* fill_val = find_prop_slice(tag_open, tag_end, "fill", &a_len);
-                if (fill_val) {
-                    parse_color_slice(fill_val, a_len, &node->has_fill, &node->fill_color, black);
-                } else {
+                cur = tag_end + 1;
+                continue;
+            }
+        }
+
+        // Vector Shapes: <path>, <ellipse>, <circle>, <rect>, <line>, <polyline>, <polygon>
+        bool is_path = (strncmp(tag_open, "<path", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>'));
+        bool is_ellipse = (strncmp(tag_open, "<ellipse", 8) == 0 && (isspace((unsigned char)tag_open[8]) || tag_open[8] == '>'));
+        bool is_circle = (strncmp(tag_open, "<circle", 7) == 0 && (isspace((unsigned char)tag_open[7]) || tag_open[7] == '>'));
+        bool is_rect = (strncmp(tag_open, "<rect", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>'));
+        bool is_line = (strncmp(tag_open, "<line", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>'));
+        bool is_polyline = (strncmp(tag_open, "<polyline", 9) == 0 && (isspace((unsigned char)tag_open[9]) || tag_open[9] == '>'));
+        bool is_polygon = (strncmp(tag_open, "<polygon", 8) == 0 && (isspace((unsigned char)tag_open[8]) || tag_open[8] == '>'));
+
+        if (is_path || is_ellipse || is_circle || is_rect || is_line || is_polyline || is_polygon) {
+            const char* tag_end = strchr(tag_open, '>');
+            if (!tag_end) { cur = tag_open + 5; continue; }
+
+            SvgNode* node = &doc->nodes[doc->node_count++];
+            memset(node, 0, sizeof(SvgNode));
+            node->type = SVG_NODE_PATH;
+            node->path = plutovg_path_create();
+            node->fill_rule = group_stack[group_depth].has_fill_rule ? group_stack[group_depth].fill_rule : PLUTOVG_FILL_RULE_NON_ZERO;
+
+            size_t a_len = 0;
+            const char* a_str = NULL;
+
+            // 1. Construct Path Geometry
+            size_t d_len = 0;
+            const char* d_str = find_prop_slice(tag_open, tag_end, "d", &d_len);
+
+            if (d_str && d_len > 0) {
+                plutovg_path_parse(node->path, d_str, (int)d_len);
+            } else if (is_ellipse || is_circle) {
+                float cx = 0, cy = 0, rx = 0, ry = 0;
+                if ((a_str = find_prop_slice(tag_open, tag_end, "cx", &a_len))) cx = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "cy", &a_len))) cy = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "rx", &a_len))) rx = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "ry", &a_len))) ry = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "r", &a_len))) { rx = ry = (float)atof(a_str); }
+                plutovg_path_add_ellipse(node->path, cx, cy, rx, ry);
+            } else if (is_rect) {
+                float rx = 0, ry = 0, rw = 0, rh = 0, r_rx = 0, r_ry = 0;
+                if ((a_str = find_prop_slice(tag_open, tag_end, "x", &a_len))) rx = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "y", &a_len))) ry = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "width", &a_len))) rw = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "height", &a_len))) rh = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "rx", &a_len))) r_rx = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "ry", &a_len))) r_ry = (float)atof(a_str);
+                if (r_rx > 0 || r_ry > 0) plutovg_path_add_round_rect(node->path, rx, ry, rw, rh, r_rx, r_ry);
+                else plutovg_path_add_rect(node->path, rx, ry, rw, rh);
+            } else if (is_line) {
+                float x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+                if ((a_str = find_prop_slice(tag_open, tag_end, "x1", &a_len))) x1 = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "y1", &a_len))) y1 = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "x2", &a_len))) x2 = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "y2", &a_len))) y2 = (float)atof(a_str);
+                plutovg_path_move_to(node->path, x1, y1);
+                plutovg_path_line_to(node->path, x2, y2);
+            } else if (is_polyline || is_polygon) {
+                size_t pts_len = 0;
+                const char* pts_str = find_prop_slice(tag_open, tag_end, "points", &pts_len);
+                if (pts_str && pts_len > 0) {
+                    const char* pe = pts_str + pts_len;
+                    const char* pp = pts_str;
+                    bool first = true;
+                    while (pp < pe) {
+                        while (pp < pe && (isspace((unsigned char)*pp) || *pp == ',')) pp++;
+                        if (pp >= pe) break;
+                        float px = (float)atof(pp);
+                        while (pp < pe && !isspace((unsigned char)*pp) && *pp != ',') pp++;
+                        while (pp < pe && (isspace((unsigned char)*pp) || *pp == ',')) pp++;
+                        if (pp >= pe) break;
+                        float py = (float)atof(pp);
+                        while (pp < pe && !isspace((unsigned char)*pp) && *pp != ',') pp++;
+
+                        if (first) { plutovg_path_move_to(node->path, px, py); first = false; }
+                        else { plutovg_path_line_to(node->path, px, py); }
+                    }
+                    if (is_polygon) plutovg_path_close(node->path);
+                }
+            }
+
+            // 2. Transform Matrix
+            size_t t_len = 0;
+            const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
+            plutovg_matrix_t elem_mat;
+            if (t_str && t_len > 0) parse_svg_transform(t_str, t_len, &elem_mat);
+            else plutovg_matrix_init_identity(&elem_mat);
+            plutovg_matrix_multiply(&node->matrix, &group_stack[group_depth].matrix, &elem_mat);
+
+            // 3. Fill-rule
+            size_t fr_len = 0;
+            const char* fr_str = find_prop_slice(tag_open, tag_end, "fill-rule", &fr_len);
+            if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
+
+            // 4. Stroke & Fill Properties
+            node->stroke_width = group_stack[group_depth].has_stroke_width ? group_stack[group_depth].stroke_width : 1.0f;
+            node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
+            node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
+
+            if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-width", &a_len))) node->stroke_width = (float)atof(a_str);
+            if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-linejoin", &a_len))) {
+                if (a_len >= 5 && strncmp(a_str, "bevel", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_BEVEL;
+                else if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_ROUND;
+            }
+            if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-linecap", &a_len))) {
+                if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_ROUND;
+                else if (a_len >= 6 && strncmp(a_str, "square", 6) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_SQUARE;
+            }
+
+            plutovg_color_t black;
+            plutovg_color_init_rgb(&black, 0, 0, 0);
+
+            // Check Stroke
+            const char* stroke_val = find_prop_slice(tag_open, tag_end, "stroke", &a_len);
+            if (stroke_val) {
+                parse_color_slice(stroke_val, a_len, &node->has_stroke, &node->stroke_color, black);
+            } else if (group_stack[group_depth].has_stroke) {
+                node->has_stroke = true;
+                node->stroke_color = group_stack[group_depth].stroke_color;
+            }
+
+            // Check Fill
+            const char* fill_val = find_prop_slice(tag_open, tag_end, "fill", &a_len);
+            if (fill_val) {
+                parse_color_slice(fill_val, a_len, &node->has_fill, &node->fill_color, black);
+            } else if (group_stack[group_depth].has_fill) {
+                node->has_fill = true;
+                node->fill_color = group_stack[group_depth].fill_color;
+            } else {
+                if (is_line || is_polyline) node->has_fill = false;
+                else {
                     node->has_fill = !node->has_stroke;
                     node->fill_color = black;
                 }
-
-                doc->path_count++;
             }
+
+            doc->path_count++;
             cur = tag_end + 1;
             continue;
         }
 
-        // 2. <text ...>content</text>
+        // <text ...>content</text>
         if (strncmp(tag_open, "<text", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
             const char* close_tag = strstr(tag_open, "</text>");
@@ -1152,12 +1343,17 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
 
                 if ((a_str = find_prop_slice(tag_open, tag_end, "fill", &a_len))) {
                     parse_color_slice(a_str, a_len, &node->has_fill, &node->fill_color, node->fill_color);
+                } else if (group_stack[group_depth].has_fill) {
+                    node->has_fill = true;
+                    node->fill_color = group_stack[group_depth].fill_color;
                 }
-                if ((a_str = find_prop_slice(tag_open, tag_end, "transform", &a_len))) {
-                    parse_svg_transform(a_str, a_len, &node->matrix);
-                } else {
-                    plutovg_matrix_init_identity(&node->matrix);
-                }
+
+                size_t t_len = 0;
+                const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
+                plutovg_matrix_t elem_mat;
+                if (t_str && t_len > 0) parse_svg_transform(t_str, t_len, &elem_mat);
+                else plutovg_matrix_init_identity(&elem_mat);
+                plutovg_matrix_multiply(&node->matrix, &group_stack[group_depth].matrix, &elem_mat);
 
                 const char* text_start = tag_end + 1;
                 size_t raw_len = (size_t)(close_tag - text_start);
@@ -1428,16 +1624,13 @@ static void draw_annotations(AppState* app) {
 
         plutovg_canvas_save(app->canvas);
 
-        // 1. Semi-transparent fill mask
         plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, is_sel ? 0.50f : 0.35f);
         plutovg_canvas_fill_rect(app->canvas, a->x, a->y, a->w, a->h);
 
-        // 2. Solid Border
         plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, 0.95f);
         plutovg_canvas_set_line_width(app->canvas, is_sel ? 2.5f / app->zoom : 1.5f / app->zoom);
         plutovg_canvas_stroke_rect(app->canvas, a->x, a->y, a->w, a->h);
 
-        // 3. Label Badge using System Monospace Font
         if (app->system_mono_face) {
             float badge_h = 16.0f / app->zoom;
             float font_sz = 11.0f / app->zoom;
@@ -1462,7 +1655,6 @@ static void draw_annotations(AppState* app) {
                                     a->x + 3.0f / app->zoom, a->y - 3.5f / app->zoom);
         }
 
-        // 4. Resize corner handles
         if (is_sel && app->annotations_selectable) {
             float hs = 8.0f / app->zoom;
             float hs2 = hs / 2.0f;
@@ -1606,7 +1798,7 @@ static bool browse_file(HWND parent, const char* filter, char* out_path, size_t 
     return false;
 }
 
-// --- Destination SVG Viewport Picker Window (Problem c) ---
+// --- Destination SVG Viewport Picker Window ---
 
 typedef struct {
     HWND hwnd;
@@ -1657,7 +1849,6 @@ static void vp_render(ViewportPicker* vp) {
     plutovg_canvas_translate(vp->canvas, vp->pan_x, vp->pan_y);
     plutovg_canvas_scale(vp->canvas, vp->zoom, vp->zoom);
 
-    // Render Destination SVG Artboard
     plutovg_canvas_save(vp->canvas);
     plutovg_canvas_set_rgb(vp->canvas, 1.0f, 1.0f, 1.0f);
     plutovg_canvas_fill_rect(vp->canvas, 0, 0, vp->svg.width, vp->svg.height);
@@ -1693,7 +1884,6 @@ static void vp_render(ViewportPicker* vp) {
         plutovg_canvas_restore(vp->canvas);
     }
 
-    // Render Selection Box
     if (vp->is_selecting_box || vp->has_box) {
         float bx, by, bw, bh;
         if (vp->is_selecting_box) {
@@ -1950,7 +2140,6 @@ static void open_destination_viewport_picker(HWND parent, const char* target_url
     vp->pan_x = ((float)vp->width - (vp->svg.width * vp->zoom)) / 2.0f;
     vp->pan_y = ((float)vp->height - (vp->svg.height * vp->zoom)) / 2.0f;
 
-    // Controls Toolbar at bottom
     CreateWindowA("BUTTON", "Apply Selected Box", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
                   20, vp->height - 42, 170, 30, hwnd_picker, (HMENU)IDC_VP_APPLY_BOX, NULL, NULL);
     CreateWindowA("BUTTON", "Apply Current View", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -1959,7 +2148,7 @@ static void open_destination_viewport_picker(HWND parent, const char* target_url
                   380, vp->height - 42, 100, 30, hwnd_picker, (HMENU)IDC_VP_CANCEL, NULL, NULL);
 }
 
-// --- URL Link Editing Dialog (Problem c) ---
+// --- URL Link Editing Dialog ---
 
 static LRESULT CALLBACK UrlLinkDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static YoloAnnotation* s_annot = NULL;
@@ -2076,7 +2265,6 @@ static void open_urllink_dialog(HWND parent, YoloAnnotation* a) {
     HWND hVpEdit = CreateWindowA("EDIT", vp_str, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
                                  20, 100, 220, 24, hwnd_dlg, (HMENU)IDC_DLG_VIEWPORT_EDIT, NULL, NULL);
 
-    // Problem c Fix: Launch Visual Viewport Picker
     CreateWindowA("BUTTON", "Select Viewport on SVG...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                   250, 100, 250, 24, hwnd_dlg, (HMENU)IDC_DLG_BTN_PICK_VIEWPORT, NULL, NULL);
 
@@ -2557,7 +2745,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_ERASEBKGND:
         return 1;
 
-    case WM_CLOSE: // Problem b: Check unsaved work on close
+    case WM_CLOSE:
         if (!check_save_changes_prompt(hwnd)) return 0;
         DestroyWindow(hwnd);
         return 0;
