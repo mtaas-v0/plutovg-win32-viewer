@@ -1623,4 +1623,126 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
-        typedef BOOL (WINAPI *SetProcessDpiAwarenessContextProc)(DPI_AWARE
+        typedef BOOL (WINAPI *SetProcessDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
+        SetProcessDpiAwarenessContextProc setDpiContext = 
+            (SetProcessDpiAwarenessContextProc)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        if (setDpiContext) {
+            setDpiContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        } else {
+            SetProcessDPIAware();
+        }
+    }
+
+    WNDCLASSEXA wc = {0};
+    wc.cbSize = sizeof(WNDCLASSEXA);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = "PlutoVGViewerWindowClass";
+    if (!RegisterClassExA(&wc)) return 1;
+
+    WNDCLASSEXA log_wc = {0};
+    log_wc.cbSize = sizeof(WNDCLASSEXA);
+    log_wc.style = CS_HREDRAW | CS_VREDRAW;
+    log_wc.lpfnWndProc = LogWndProc;
+    log_wc.hInstance = hInstance;
+    log_wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    log_wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    log_wc.lpszClassName = "PlutoVGLogWindowClass";
+    RegisterClassExA(&log_wc);
+
+    g_app.hwnd_main = CreateWindowExA(
+        WS_EX_ACCEPTFILES,
+        wc.lpszClassName,
+        "PlutoVG Typography & SVG Viewer",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        1100, 800,
+        NULL, NULL, hInstance, NULL
+    );
+    if (!g_app.hwnd_main) return 1;
+
+    g_app.hwnd_log = CreateWindowExA(
+        WS_EX_TOOLWINDOW,
+        log_wc.lpszClassName,
+        "SVG & Typography Debug Log",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        640, 480,
+        g_app.hwnd_main,
+        NULL, hInstance, NULL
+    );
+
+    if (g_app.hwnd_log) {
+        RECT rc;
+        GetClientRect(g_app.hwnd_log, &rc);
+        g_app.hwnd_log_edit = CreateWindowExA(
+            0,
+            "EDIT",
+            "",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+            0, 0, rc.right, rc.bottom,
+            g_app.hwnd_log,
+            (HMENU)IDC_LOG_EDIT,
+            hInstance,
+            NULL
+        );
+
+        g_app.hfont_log = CreateFontA(
+            15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas"
+        );
+        if (g_app.hfont_log) {
+            SendMessageA(g_app.hwnd_log_edit, WM_SETFONT, (WPARAM)g_app.hfont_log, TRUE);
+        }
+    }
+
+    create_app_menu(g_app.hwnd_main);
+
+    ACCEL accels[] = {
+        { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
+        { FCONTROL | FVIRTKEY, 'E', ID_MENU_EXPORT_SVG },
+        { FVIRTKEY, 'O', ID_MENU_OPEN_FONT },
+        { FVIRTKEY, 'C', ID_MENU_TOGGLE_CACHE },
+        { FVIRTKEY, 'L', ID_MENU_TOGGLE_LOG },
+        { FVIRTKEY, 'G', ID_MENU_TOGGLE_GRID },
+        { FVIRTKEY, VK_SPACE, ID_MENU_RESET_VIEW },
+        { FVIRTKEY, '0', ID_MENU_RESET_VIEW },
+        { FVIRTKEY, VK_OEM_PLUS, ID_MENU_ZOOM_IN },
+        { FVIRTKEY, VK_ADD, ID_MENU_ZOOM_IN },
+        { FVIRTKEY, VK_OEM_MINUS, ID_MENU_ZOOM_OUT },
+        { FVIRTKEY, VK_SUBTRACT, ID_MENU_ZOOM_OUT }
+    };
+    HACCEL hAccel = CreateAcceleratorTableA(accels, sizeof(accels) / sizeof(accels[0]));
+
+    ShowWindow(g_app.hwnd_main, nCmdShow);
+    UpdateWindow(g_app.hwnd_main);
+
+    int argc = 0;
+    LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argvW && argc > 1) {
+        char initial_path[MAX_PATH];
+        WideCharToMultiByte(CP_UTF8, 0, argvW[1], -1, initial_path, MAX_PATH, NULL, NULL);
+
+        const char* ext = PathFindExtensionA(initial_path);
+        if (_stricmp(ext, ".svg") == 0) {
+            load_svg_file(&g_app, initial_path);
+        }
+        LocalFree(argvW);
+        InvalidateRect(g_app.hwnd_main, NULL, FALSE);
+    }
+
+    MSG msg;
+    while (GetMessageA(&msg, NULL, 0, 0)) {
+        if (!TranslateAcceleratorA(g_app.hwnd_main, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+
+    if (hAccel) DestroyAcceleratorTable(hAccel);
+    return (int)msg.wParam;
+}
