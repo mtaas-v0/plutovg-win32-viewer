@@ -53,22 +53,38 @@ else()
     install(TARGETS PlutoVGViewer DESTINATION bin)
             
     if(TRUE) #MINGW
-        # Get the directory of the active MinGW compiler
-        get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        # 1. Normalize the compiler path to use standard CMake forward slashes
+        file(TO_CMAKE_PATH "${CMAKE_CXX_COMPILER}" CLEAN_COMPILER_PATH)
         
-        # List the runtime DLLs you want to bundle
-        set(MINGW_RUNTIMES
-            "${MINGW_BIN_DIR}/libwinpthread-1.dll"
-            "${MINGW_BIN_DIR}/libgcc_s_seh-1.dll"
-            "${MINGW_BIN_DIR}/libstdc++-6.dll"
+        # 2. Extract the bin directory
+        get_filename_component(MINGW_BIN_DIR "${CLEAN_COMPILER_PATH}" DIRECTORY)
+        
+        # 3. Use find_file to safely verify the DLL exists in the path
+        find_file(WINPTHREAD_DLL
+            NAMES "libwinpthread-1.dll"
+            PATHS "${MINGW_BIN_DIR}"
+            NO_DEFAULT_PATH
         )
-    
-        # Copy them during the install phase
-        foreach(dll ${MINGW_RUNTIMES})
-            if(EXISTS "${dll}")
-                install(FILES "${dll}" DESTINATION bin)
-            endif()
-        endforeach()
+        
+        # 4. Fallback: If toolchain tracking fails, look in standard GitHub Actions MSYS2 locations
+        if(NOT WINPTHREAD_DLL)
+            find_file(WINPTHREAD_DLL
+                NAMES "libwinpthread-1.dll"
+                PATHS "C:/msys64/mingw64/bin" "C:/msys64/ucrt64/bin" "C:/msys64/clang64/bin"
+            )
+        endif()
+        
+        # 5. Handle the installation step
+        if(WINPTHREAD_DLL)
+            message(STATUS "Found winpthread DLL for installation: ${WINPTHREAD_DLL}")
+            
+            # Installs the DLL directly into the same 'bin' directory as your executable
+            install(FILES "${WINPTHREAD_DLL}"
+                DESTINATION bin
+            )
+        else()
+            message(FATAL_ERROR "Could not find libwinpthread-1.dll for installation!")
+        endif()
     endif()
 
 endif()
