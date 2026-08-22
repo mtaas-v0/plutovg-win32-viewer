@@ -48,7 +48,7 @@ if(MSVC)
     target_link_options(PlutoVGViewer PRIVATE "/MANIFEST:NO")
 else()
     target_compile_options(PlutoVGViewer PRIVATE -Wall -Wextra)
-)
+
     install(TARGETS PlutoVGViewer DESTINATION bin)
             
     if(MINGW)
