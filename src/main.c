@@ -41,9 +41,14 @@
 #define IDC_DLG_URL_EDIT          3001
 #define IDC_DLG_VIEWPORT_EDIT     3002
 #define IDC_DLG_BTN_BROWSE        3003
-#define IDC_DLG_BTN_CAPTURE       3004
+#define IDC_DLG_BTN_PICK_VIEWPORT 3004
 #define IDC_DLG_BTN_OK            3005
 #define IDC_DLG_BTN_CANCEL        3006
+
+// Viewport Picker Dialog Controls
+#define IDC_VP_APPLY_BOX          4001
+#define IDC_VP_APPLY_VIEW         4002
+#define IDC_VP_CANCEL             4003
 
 #define MAX_FONTS                 64
 #define MAX_SVG_NODES             8192
@@ -79,7 +84,7 @@ static const AnnotationCategory DEFAULT_CATEGORIES[MAX_CATEGORIES] = {
     { 5, "matrix",   0.10f, 0.80f, 0.85f }, // Cyan
     { 6, "script",   0.95f, 0.85f, 0.15f }, // Yellow
     { 7, "diagram",  0.95f, 0.30f, 0.65f }, // Pink
-    { 8, "urllink",  0.05f, 0.85f, 0.80f }  // Vibrant Teal (Special URL link class)
+    { 8, "urllink",  0.05f, 0.85f, 0.80f }  // Teal (URL link)
 };
 
 // --- Extended YOLO Annotation Structure ---
@@ -159,7 +164,6 @@ typedef struct {
     HWND hwnd_log;
     HWND hwnd_log_edit;
     HFONT hfont_log;
-    HWND hwnd_urldlg;
 
     // Viewport
     float zoom;
@@ -181,7 +185,8 @@ typedef struct {
 
     // Annotation Data & Settings
     AppInteractionMode interaction_mode;
-    bool annotations_selectable; // Thing B: Toggle selectable annotations
+    bool annotations_selectable;
+    bool is_dirty; // Problem b: Tracks unsaved changes
     YoloAnnotation annotations[MAX_ANNOTATIONS];
     int annotation_count;
     int selected_annotation_idx;
@@ -203,11 +208,19 @@ typedef struct {
     bool has_svg_loaded;
     bool show_grid;
 
-    // Monospace UI Font (Thing A)
+    // Monospace UI Font
     plutovg_font_face_t* system_mono_face;
 } AppState;
 
 static AppState g_app;
+
+// Forward declarations
+static void update_window_title(void);
+static bool save_yolo_annotations(AppState* app, const char* yaml_path);
+static bool browse_file(HWND parent, const char* filter, char* out_path, size_t max_len, bool is_save, const char* def_ext);
+static void screen_to_canvas(AppState* app, float sx, float sy, float* cx, float* cy);
+static void load_svg_file(AppState* app, const char* path);
+static void open_destination_viewport_picker(HWND parent, const char* target_url, HWND hwnd_target_edit);
 
 // --- Path String Buffer ---
 typedef struct {
@@ -269,7 +282,45 @@ static void toggle_log_window(void) {
     CheckMenuItem(GetMenu(g_app.hwnd_main), ID_MENU_TOGGLE_LOG, !is_visible ? MF_CHECKED : MF_UNCHECKED);
 }
 
-// --- System Monospace Font Loader (Thing A) ---
+// --- Window Title & Dirty Check (Problem b) ---
+
+static void update_window_title(void) {
+    char title[512];
+    if (g_app.has_svg_loaded) {
+        snprintf(title, sizeof(title), "%s%s - PlutoVG Typography & YOLO Annotation Editor",
+                 g_app.is_dirty ? "*" : "", g_app.current_svg_name);
+    } else {
+        snprintf(title, sizeof(title), "PlutoVG Typography & YOLO Annotation Editor");
+    }
+    SetWindowTextA(g_app.hwnd_main, title);
+}
+
+static bool check_save_changes_prompt(HWND hwnd) {
+    if (!g_app.is_dirty || g_app.annotation_count == 0) return true;
+
+    int res = MessageBoxA(hwnd,
+        "You have unsaved annotations.\nDo you want to save changes before continuing?",
+        "Unsaved Annotations",
+        MB_YESNOCANCEL | MB_ICONQUESTION);
+
+    if (res == IDYES) {
+        if (strlen(g_app.annot_file_path) > 0) {
+            return save_yolo_annotations(&g_app, g_app.annot_file_path);
+        } else {
+            char path[MAX_PATH];
+            if (browse_file(hwnd, "YOLO Annotation YAML (*.yaml)\0*.yaml\0All Files (*.*)\0*.*\0", path, sizeof(path), true, "yaml")) {
+                return save_yolo_annotations(&g_app, path);
+            }
+            return false;
+        }
+    } else if (res == IDNO) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// --- System Monospace Font Loader ---
 
 static void load_system_mono_font(AppState* app) {
     const char* sys_fonts[] = {
@@ -337,7 +388,7 @@ static void update_annotation_normalized(AppState* app, YoloAnnotation* a, float
     a->y_center = (y + h / 2.0f) / sh;
 }
 
-// --- Extended YOLO YAML Serializer & Loader (Thing C) ---
+// --- Extended YOLO YAML Serializer & Loader ---
 
 static void get_default_annot_path(const char* svg_path, char* out_yaml, size_t max_len) {
     strncpy(out_yaml, svg_path, max_len - 1);
@@ -374,7 +425,6 @@ static bool save_yolo_annotations(AppState* app, const char* yaml_path) {
         fprintf(f, "    bbox: [%.6f, %.6f, %.6f, %.6f]\n", a->x_center, a->y_center, a->width, a->height);
         fprintf(f, "    rect: [%.2f, %.2f, %.2f, %.2f]\n", a->x, a->y, a->w, a->h);
 
-        // Extended urllink fields
         if (strlen(a->url) > 0) {
             fprintf(f, "    url: \"%s\"\n", a->url);
         }
@@ -387,6 +437,8 @@ static bool save_yolo_annotations(AppState* app, const char* yaml_path) {
 
     fclose(f);
     strncpy(app->annot_file_path, yaml_path, MAX_PATH - 1);
+    app->is_dirty = false;
+    update_window_title();
     log_append("[ANNOT] Saved %d annotations to %s", app->annotation_count, yaml_path);
     return true;
 }
@@ -479,11 +531,13 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
 
     fclose(f);
     strncpy(app->annot_file_path, yaml_path, MAX_PATH - 1);
+    app->is_dirty = false;
+    update_window_title();
     log_append("[ANNOT] Auto-loaded %d annotations from %s", app->annotation_count, yaml_path);
     return true;
 }
 
-// --- Launch URL Link (Thing C) ---
+// --- Launch URL Link ---
 
 static void launch_urllink(const YoloAnnotation* a) {
     if (!a || strlen(a->url) == 0) return;
@@ -497,11 +551,9 @@ static void launch_urllink(const YoloAnnotation* a) {
 
     char target_file[MAX_PATH];
     const char* url_str = a->url;
-    if (_strnicmp(url_str, "file:///", 8) == 0) {
-        url_str += 8;
-    } else if (_strnicmp(url_str, "file://", 7) == 0) {
-        url_str += 7;
-    }
+    if (_strnicmp(url_str, "file:///", 8) == 0) url_str += 8;
+    else if (_strnicmp(url_str, "file://", 7) == 0) url_str += 7;
+
     strncpy(target_file, url_str, MAX_PATH - 1);
     for (char* p = target_file; *p; ++p) {
         if (*p == '/') *p = '\\';
@@ -735,15 +787,14 @@ static plutovg_font_face_t* registry_find_font(FontRegistry* reg, const char* fa
     return reg->fallback_face;
 }
 
-static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
+static void discover_fonts_for_svg(FontRegistry* reg, char* out_fonts_dir, size_t dir_len, const char* svg_path) {
     char svg_dir[MAX_PATH];
     strncpy(svg_dir, svg_path, MAX_PATH - 1);
     PathRemoveFileSpecA(svg_dir);
 
-    snprintf(app->fonts_dir, sizeof(app->fonts_dir), "%s\\fonts", svg_dir);
-    log_append("[FONTS] Scanning fonts directory: %s", app->fonts_dir);
+    snprintf(out_fonts_dir, dir_len, "%s\\fonts", svg_dir);
 
-    const char* search_folders[] = { app->fonts_dir, svg_dir };
+    const char* search_folders[] = { out_fonts_dir, svg_dir };
     const char* exts[] = { "\\*.ttf", "\\*.otf", "\\*.ttc" };
 
     for (int f = 0; f < 2; ++f) {
@@ -763,7 +814,7 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
                         strncpy(font_key, fd.cFileName, sizeof(font_key) - 1);
                         PathRemoveExtensionA(font_key);
 
-                        registry_add_font(&app->registry, font_key, full_path);
+                        registry_add_font(reg, font_key, full_path);
                     }
                 } while (FindNextFileA(hFind, &fd));
                 FindClose(hFind);
@@ -771,15 +822,15 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
         }
     }
 
-    if (!app->registry.fallback_face) {
+    if (!reg->fallback_face) {
         FontInfo sys_font;
         if (FontHelper_GetSystemFont(&sys_font)) {
-            registry_add_font(&app->registry, "system_default", sys_font.font_path);
+            registry_add_font(reg, "system_default", sys_font.font_path);
         }
     }
 }
 
-// --- Attribute Locator ---
+// --- Attribute & CSS Style Locator (Problem a Fix) ---
 
 static const char* find_attr_slice(const char* tag_start, const char* tag_end, const char* attr_name, size_t* out_len) {
     if (!tag_start || !tag_end || tag_start >= tag_end || !attr_name) return NULL;
@@ -808,6 +859,54 @@ static const char* find_attr_slice(const char* tag_start, const char* tag_end, c
         }
         p++;
     }
+    return NULL;
+}
+
+// Finds property from direct XML attribute OR inside style="..."
+static const char* find_prop_slice(const char* tag_start, const char* tag_end, const char* prop_name, size_t* out_len) {
+    if (!tag_start || !tag_end || tag_start >= tag_end || !prop_name) return NULL;
+
+    // 1. Direct attribute: prop="val"
+    size_t direct_len = 0;
+    const char* direct_val = find_attr_slice(tag_start, tag_end, prop_name, &direct_len);
+    if (direct_val && direct_len > 0) {
+        *out_len = direct_len;
+        return direct_val;
+    }
+
+    // 2. CSS inline style: style="...; prop: val; ..."
+    size_t style_len = 0;
+    const char* style_str = find_attr_slice(tag_start, tag_end, "style", &style_len);
+    if (style_str && style_len > 0) {
+        const char* style_end = style_str + style_len;
+        const char* p = style_str;
+        size_t name_len = strlen(prop_name);
+
+        while (p < style_end) {
+            while (p < style_end && (isspace((unsigned char)*p) || *p == ';')) p++;
+            if (p >= style_end) break;
+
+            if (p + name_len < style_end && strncmp(p, prop_name, name_len) == 0) {
+                const char* colon = p + name_len;
+                while (colon < style_end && isspace((unsigned char)*colon)) colon++;
+                if (colon < style_end && *colon == ':') {
+                    const char* val_start = colon + 1;
+                    while (val_start < style_end && isspace((unsigned char)*val_start)) val_start++;
+                    const char* val_end = val_start;
+                    while (val_end < style_end && *val_end != ';' && *val_end != '\"' && *val_end != '\'') val_end++;
+                    while (val_end > val_start && isspace((unsigned char)*(val_end - 1))) val_end--;
+
+                    if (val_end > val_start) {
+                        *out_len = (size_t)(val_end - val_start);
+                        return val_start;
+                    }
+                }
+            }
+            while (p < style_end && *p != ';') p++;
+            if (p < style_end && *p == ';') p++;
+        }
+    }
+
     return NULL;
 }
 
@@ -912,7 +1011,7 @@ static void free_svg_doc(SvgDocument* doc) {
     doc->text_count = 0;
 }
 
-static void parse_svg(AppState* app, const char* svg_path) {
+static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
     FILE* f = fopen(svg_path, "rb");
     if (!f) return;
 
@@ -928,9 +1027,9 @@ static void parse_svg(AppState* app, const char* svg_path) {
     buffer[size] = '\0';
     fclose(f);
 
-    free_svg_doc(&app->svg);
-    app->svg.width = 600.0f;
-    app->svg.height = 400.0f;
+    free_svg_doc(doc);
+    doc->width = 600.0f;
+    doc->height = 400.0f;
 
     size_t val_len = 0;
     const char* val_ptr = NULL;
@@ -939,15 +1038,13 @@ static void parse_svg(AppState* app, const char* svg_path) {
     if (root_svg) {
         const char* root_end = strchr(root_svg, '>');
         if (root_end) {
-            if ((val_ptr = find_attr_slice(root_svg, root_end, "width", &val_len))) app->svg.width = (float)atof(val_ptr);
-            if ((val_ptr = find_attr_slice(root_svg, root_end, "height", &val_len))) app->svg.height = (float)atof(val_ptr);
+            if ((val_ptr = find_prop_slice(root_svg, root_end, "width", &val_len))) doc->width = (float)atof(val_ptr);
+            if ((val_ptr = find_prop_slice(root_svg, root_end, "height", &val_len))) doc->height = (float)atof(val_ptr);
         }
     }
 
-    log_append("[SVG] Parsing elements (Document size: %.1fx%.1f)", app->svg.width, app->svg.height);
-
     const char* cur = buffer;
-    while (*cur && app->svg.node_count < MAX_SVG_NODES) {
+    while (*cur && doc->node_count < MAX_SVG_NODES) {
         const char* tag_open = strchr(cur, '<');
         if (!tag_open) break;
 
@@ -963,9 +1060,9 @@ static void parse_svg(AppState* app, const char* svg_path) {
             if (!tag_end) { cur = tag_open + 5; continue; }
 
             size_t d_len = 0;
-            const char* d_str = find_attr_slice(tag_open, tag_end, "d", &d_len);
+            const char* d_str = find_prop_slice(tag_open, tag_end, "d", &d_len);
             if (d_str && d_len > 0) {
-                SvgNode* node = &app->svg.nodes[app->svg.node_count++];
+                SvgNode* node = &doc->nodes[doc->node_count++];
                 memset(node, 0, sizeof(SvgNode));
                 node->type = SVG_NODE_PATH;
                 node->path = plutovg_path_create();
@@ -974,12 +1071,12 @@ static void parse_svg(AppState* app, const char* svg_path) {
                 plutovg_path_parse(node->path, d_str, (int)d_len);
 
                 size_t t_len = 0;
-                const char* t_str = find_attr_slice(tag_open, tag_end, "transform", &t_len);
+                const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
                 if (t_str && t_len > 0) parse_svg_transform(t_str, t_len, &node->matrix);
                 else plutovg_matrix_init_identity(&node->matrix);
 
                 size_t fr_len = 0;
-                const char* fr_str = find_attr_slice(tag_open, tag_end, "fill-rule", &fr_len);
+                const char* fr_str = find_prop_slice(tag_open, tag_end, "fill-rule", &fr_len);
                 if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) {
                     node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
                 }
@@ -990,12 +1087,12 @@ static void parse_svg(AppState* app, const char* svg_path) {
 
                 size_t a_len = 0;
                 const char* a_str = NULL;
-                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-width", &a_len))) node->stroke_width = (float)atof(a_str);
-                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-linejoin", &a_len))) {
+                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-width", &a_len))) node->stroke_width = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-linejoin", &a_len))) {
                     if (a_len >= 5 && strncmp(a_str, "bevel", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_BEVEL;
                     else if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_join = PLUTOVG_LINE_JOIN_ROUND;
                 }
-                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke-linecap", &a_len))) {
+                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-linecap", &a_len))) {
                     if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_ROUND;
                     else if (a_len >= 6 && strncmp(a_str, "square", 6) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_SQUARE;
                 }
@@ -1003,17 +1100,21 @@ static void parse_svg(AppState* app, const char* svg_path) {
                 plutovg_color_t black;
                 plutovg_color_init_rgb(&black, 0, 0, 0);
 
-                if ((a_str = find_attr_slice(tag_open, tag_end, "stroke", &a_len))) {
-                    parse_color_slice(a_str, a_len, &node->has_stroke, &node->stroke_color, black);
+                // Problem a Fix: Check stroke/fill from direct attribute or CSS style
+                const char* stroke_val = find_prop_slice(tag_open, tag_end, "stroke", &a_len);
+                if (stroke_val) {
+                    parse_color_slice(stroke_val, a_len, &node->has_stroke, &node->stroke_color, black);
                 }
-                if ((a_str = find_attr_slice(tag_open, tag_end, "fill", &a_len))) {
-                    parse_color_slice(a_str, a_len, &node->has_fill, &node->fill_color, black);
+
+                const char* fill_val = find_prop_slice(tag_open, tag_end, "fill", &a_len);
+                if (fill_val) {
+                    parse_color_slice(fill_val, a_len, &node->has_fill, &node->fill_color, black);
                 } else {
                     node->has_fill = !node->has_stroke;
                     node->fill_color = black;
                 }
 
-                app->svg.path_count++;
+                doc->path_count++;
             }
             cur = tag_end + 1;
             continue;
@@ -1024,7 +1125,7 @@ static void parse_svg(AppState* app, const char* svg_path) {
             const char* tag_end = strchr(tag_open, '>');
             const char* close_tag = strstr(tag_open, "</text>");
             if (tag_end && close_tag && close_tag > tag_end) {
-                SvgNode* node = &app->svg.nodes[app->svg.node_count++];
+                SvgNode* node = &doc->nodes[doc->node_count++];
                 memset(node, 0, sizeof(SvgNode));
                 node->type = SVG_NODE_TEXT;
                 node->font_size = 1.0f;
@@ -1036,23 +1137,23 @@ static void parse_svg(AppState* app, const char* svg_path) {
                 size_t a_len = 0;
                 const char* a_str = NULL;
 
-                if ((a_str = find_attr_slice(tag_open, tag_end, "font-family", &a_len))) {
+                if ((a_str = find_prop_slice(tag_open, tag_end, "font-family", &a_len))) {
                     size_t cplen = a_len < sizeof(node->font_family) - 1 ? a_len : sizeof(node->font_family) - 1;
                     strncpy(node->font_family, a_str, cplen);
                     node->font_family[cplen] = '\0';
                 }
-                if ((a_str = find_attr_slice(tag_open, tag_end, "font-size", &a_len))) node->font_size = (float)atof(a_str);
-                if ((a_str = find_attr_slice(tag_open, tag_end, "font-style", &a_len))) {
+                if ((a_str = find_prop_slice(tag_open, tag_end, "font-size", &a_len))) node->font_size = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "font-style", &a_len))) {
                     if (a_len >= 6 && strncmp(a_str, "italic", 6) == 0) node->is_italic = true;
                 }
-                if ((a_str = find_attr_slice(tag_open, tag_end, "font-weight", &a_len))) node->font_weight = atoi(a_str);
-                if ((a_str = find_attr_slice(tag_open, tag_end, "x", &a_len))) node->x = (float)atof(a_str);
-                if ((a_str = find_attr_slice(tag_open, tag_end, "y", &a_len))) node->y = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "font-weight", &a_len))) node->font_weight = atoi(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "x", &a_len))) node->x = (float)atof(a_str);
+                if ((a_str = find_prop_slice(tag_open, tag_end, "y", &a_len))) node->y = (float)atof(a_str);
 
-                if ((a_str = find_attr_slice(tag_open, tag_end, "fill", &a_len))) {
+                if ((a_str = find_prop_slice(tag_open, tag_end, "fill", &a_len))) {
                     parse_color_slice(a_str, a_len, &node->has_fill, &node->fill_color, node->fill_color);
                 }
-                if ((a_str = find_attr_slice(tag_open, tag_end, "transform", &a_len))) {
+                if ((a_str = find_prop_slice(tag_open, tag_end, "transform", &a_len))) {
                     parse_svg_transform(a_str, a_len, &node->matrix);
                 } else {
                     plutovg_matrix_init_identity(&node->matrix);
@@ -1063,9 +1164,9 @@ static void parse_svg(AppState* app, const char* svg_path) {
                 node->text_len = clean_and_unescape_text(text_start, raw_len, node->text, sizeof(node->text));
 
                 if (node->text_len > 0) {
-                    app->svg.text_count++;
+                    doc->text_count++;
                 } else {
-                    app->svg.node_count--;
+                    doc->node_count--;
                 }
                 cur = close_tag + 7;
                 continue;
@@ -1074,7 +1175,6 @@ static void parse_svg(AppState* app, const char* svg_path) {
         cur = tag_open + 1;
     }
 
-    log_append("[RESULT] Loaded %d paths and %d text nodes successfully.", app->svg.path_count, app->svg.text_count);
     free(buffer);
 }
 
@@ -1104,8 +1204,8 @@ static void load_svg_file(AppState* app, const char* path) {
     log_append("[APP] Opening SVG: %s", path);
 
     registry_init(&app->registry);
-    discover_fonts_for_svg(app, path);
-    parse_svg(app, path);
+    discover_fonts_for_svg(&app->registry, app->fonts_dir, sizeof(app->fonts_dir), path);
+    parse_svg_document(&app->svg, path);
 
     strncpy(app->current_svg_path, path, MAX_PATH - 1);
     FontHelper_GetFontName(path, app->current_svg_name, sizeof(app->current_svg_name));
@@ -1119,6 +1219,8 @@ static void load_svg_file(AppState* app, const char* path) {
         app->annotation_count = 0;
         app->selected_annotation_idx = -1;
         strncpy(app->annot_file_path, yml_path, MAX_PATH - 1);
+        app->is_dirty = false;
+        update_window_title();
     }
 
     reset_view(app);
@@ -1311,7 +1413,7 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_restore(canvas);
 }
 
-// --- Render Semi-Transparent YOLO Annotations (Thing A: System Monospace Font) ---
+// --- Render Semi-Transparent YOLO Annotations ---
 static void draw_annotations(AppState* app) {
     if (!app->canvas) return;
 
@@ -1326,7 +1428,7 @@ static void draw_annotations(AppState* app) {
 
         plutovg_canvas_save(app->canvas);
 
-        // 1. Semi-transparent mask fill (35% normally, 50% if selected)
+        // 1. Semi-transparent fill mask
         plutovg_canvas_set_rgba(app->canvas, cat->r, cat->g, cat->b, is_sel ? 0.50f : 0.35f);
         plutovg_canvas_fill_rect(app->canvas, a->x, a->y, a->w, a->h);
 
@@ -1335,7 +1437,7 @@ static void draw_annotations(AppState* app) {
         plutovg_canvas_set_line_width(app->canvas, is_sel ? 2.5f / app->zoom : 1.5f / app->zoom);
         plutovg_canvas_stroke_rect(app->canvas, a->x, a->y, a->w, a->h);
 
-        // 3. Label Badge strictly using System Monospace Font (Thing A)
+        // 3. Label Badge using System Monospace Font
         if (app->system_mono_face) {
             float badge_h = 16.0f / app->zoom;
             float font_sz = 11.0f / app->zoom;
@@ -1360,7 +1462,7 @@ static void draw_annotations(AppState* app) {
                                     a->x + 3.0f / app->zoom, a->y - 3.5f / app->zoom);
         }
 
-        // 4. Resize corner handles if selected
+        // 4. Resize corner handles
         if (is_sel && app->annotations_selectable) {
             float hs = 8.0f / app->zoom;
             float hs2 = hs / 2.0f;
@@ -1504,7 +1606,361 @@ static bool browse_file(HWND parent, const char* filter, char* out_path, size_t 
     return false;
 }
 
-// --- URL Link Editing Dialog Procedure (Thing C) ---
+// --- Destination SVG Viewport Picker Window (Problem c) ---
+
+typedef struct {
+    HWND hwnd;
+    HWND hwnd_target_edit;
+    char svg_path[MAX_PATH];
+    SvgDocument svg;
+    FontRegistry registry;
+    char fonts_dir[MAX_PATH];
+
+    int width;
+    int height;
+    plutovg_surface_t* surface;
+    plutovg_canvas_t* canvas;
+
+    float zoom;
+    float pan_x;
+    float pan_y;
+
+    bool is_dragging_view;
+    bool is_selecting_box;
+    POINT last_mouse;
+    float drag_start_cx;
+    float drag_start_cy;
+    float drag_curr_cx;
+    float drag_curr_cy;
+
+    bool has_box;
+    float box_x, box_y, box_w, box_h;
+} ViewportPicker;
+
+static ViewportPicker g_vp_picker;
+
+static void vp_screen_to_canvas(ViewportPicker* vp, float sx, float sy, float* cx, float* cy) {
+    *cx = (sx - vp->pan_x) / vp->zoom;
+    *cy = (sy - vp->pan_y) / vp->zoom;
+}
+
+static void vp_render(ViewportPicker* vp) {
+    if (!vp->canvas) return;
+
+    plutovg_canvas_save(vp->canvas);
+    plutovg_canvas_reset_matrix(vp->canvas);
+    plutovg_canvas_set_rgb(vp->canvas, 0.12f, 0.13f, 0.15f);
+    plutovg_canvas_fill_rect(vp->canvas, 0, 0, (float)vp->width, (float)vp->height);
+    plutovg_canvas_restore(vp->canvas);
+
+    plutovg_canvas_save(vp->canvas);
+    plutovg_canvas_translate(vp->canvas, vp->pan_x, vp->pan_y);
+    plutovg_canvas_scale(vp->canvas, vp->zoom, vp->zoom);
+
+    // Render Destination SVG Artboard
+    plutovg_canvas_save(vp->canvas);
+    plutovg_canvas_set_rgb(vp->canvas, 1.0f, 1.0f, 1.0f);
+    plutovg_canvas_fill_rect(vp->canvas, 0, 0, vp->svg.width, vp->svg.height);
+    plutovg_canvas_restore(vp->canvas);
+
+    for (int i = 0; i < vp->svg.node_count; ++i) {
+        SvgNode* node = &vp->svg.nodes[i];
+        plutovg_canvas_save(vp->canvas);
+        plutovg_canvas_transform(vp->canvas, &node->matrix);
+
+        if (node->type == SVG_NODE_PATH && node->path) {
+            plutovg_canvas_set_fill_rule(vp->canvas, node->fill_rule);
+            if (node->has_fill) {
+                plutovg_canvas_set_color(vp->canvas, &node->fill_color);
+                plutovg_canvas_fill_path(vp->canvas, node->path);
+            }
+            if (node->has_stroke) {
+                plutovg_canvas_set_color(vp->canvas, &node->stroke_color);
+                plutovg_canvas_set_line_width(vp->canvas, node->stroke_width);
+                plutovg_canvas_set_line_join(vp->canvas, node->stroke_join);
+                plutovg_canvas_set_line_cap(vp->canvas, node->stroke_cap);
+                plutovg_canvas_stroke_path(vp->canvas, node->path);
+            }
+        } else if (node->type == SVG_NODE_TEXT) {
+            plutovg_font_face_t* face = registry_find_font(&vp->registry, node->font_family);
+            if (face) {
+                plutovg_canvas_set_font_face(vp->canvas, face);
+                plutovg_canvas_set_font_size(vp->canvas, node->font_size);
+                plutovg_canvas_set_color(vp->canvas, &node->fill_color);
+                plutovg_canvas_fill_text(vp->canvas, node->text, node->text_len, PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
+            }
+        }
+        plutovg_canvas_restore(vp->canvas);
+    }
+
+    // Render Selection Box
+    if (vp->is_selecting_box || vp->has_box) {
+        float bx, by, bw, bh;
+        if (vp->is_selecting_box) {
+            float x1 = vp->drag_start_cx, y1 = vp->drag_start_cy;
+            float x2 = vp->drag_curr_cx, y2 = vp->drag_curr_cy;
+            bx = x1 < x2 ? x1 : x2;
+            by = y1 < y2 ? y1 : y2;
+            bw = fabsf(x2 - x1);
+            bh = fabsf(y2 - y1);
+        } else {
+            bx = vp->box_x; by = vp->box_y; bw = vp->box_w; bh = vp->box_h;
+        }
+
+        plutovg_canvas_save(vp->canvas);
+        plutovg_canvas_set_rgba(vp->canvas, 0.05f, 0.85f, 0.80f, 0.35f);
+        plutovg_canvas_fill_rect(vp->canvas, bx, by, bw, bh);
+
+        plutovg_canvas_set_rgba(vp->canvas, 0.95f, 0.85f, 0.15f, 0.95f);
+        plutovg_canvas_set_line_width(vp->canvas, 2.0f / vp->zoom);
+        plutovg_canvas_stroke_rect(vp->canvas, bx, by, bw, bh);
+        plutovg_canvas_restore(vp->canvas);
+    }
+
+    plutovg_canvas_restore(vp->canvas);
+}
+
+static LRESULT CALLBACK ViewportPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    ViewportPicker* vp = &g_vp_picker;
+
+    switch (msg) {
+    case WM_SIZE: {
+        int w = LOWORD(lParam);
+        int h = HIWORD(lParam);
+        if (w > 0 && h > 0) {
+            vp->width = w;
+            vp->height = h;
+            if (vp->canvas) plutovg_canvas_destroy(vp->canvas);
+            if (vp->surface) plutovg_surface_destroy(vp->surface);
+            vp->surface = plutovg_surface_create(w, h);
+            vp->canvas = plutovg_canvas_create(vp->surface);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        POINT pt;
+        pt.x = GET_X_LPARAM(lParam);
+        pt.y = GET_Y_LPARAM(lParam);
+        ScreenToClient(hwnd, &pt);
+
+        short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        float factor = (delta > 0) ? 1.15f : (1.0f / 1.15f);
+        float new_zoom = vp->zoom * factor;
+        if (new_zoom > 0.01f && new_zoom < 200.0f) {
+            vp->pan_x = (float)pt.x - ((float)pt.x - vp->pan_x) * (new_zoom / vp->zoom);
+            vp->pan_y = (float)pt.y - ((float)pt.y - vp->pan_y) * (new_zoom / vp->zoom);
+            vp->zoom = new_zoom;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        float cx, cy;
+        vp_screen_to_canvas(vp, (float)mx, (float)my, &cx, &cy);
+
+        vp->is_selecting_box = true;
+        vp->drag_start_cx = cx;
+        vp->drag_start_cy = cy;
+        vp->drag_curr_cx = cx;
+        vp->drag_curr_cy = cy;
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_RBUTTONDOWN: {
+        vp->is_dragging_view = true;
+        vp->last_mouse.x = GET_X_LPARAM(lParam);
+        vp->last_mouse.y = GET_Y_LPARAM(lParam);
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+
+        if (vp->is_selecting_box) {
+            float cx, cy;
+            vp_screen_to_canvas(vp, (float)mx, (float)my, &cx, &cy);
+            vp->drag_curr_cx = cx;
+            vp->drag_curr_cy = cy;
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (vp->is_dragging_view) {
+            vp->pan_x += (float)(mx - vp->last_mouse.x);
+            vp->pan_y += (float)(my - vp->last_mouse.y);
+            vp->last_mouse.x = mx;
+            vp->last_mouse.y = my;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (vp->is_selecting_box) {
+            vp->is_selecting_box = false;
+            float x1 = vp->drag_start_cx, y1 = vp->drag_start_cy;
+            float x2 = vp->drag_curr_cx, y2 = vp->drag_curr_cy;
+            float bw = fabsf(x2 - x1);
+            float bh = fabsf(y2 - y1);
+            if (bw > 4.0f && bh > 4.0f) {
+                vp->has_box = true;
+                vp->box_x = x1 < x2 ? x1 : x2;
+                vp->box_y = y1 < y2 ? y1 : y2;
+                vp->box_w = bw;
+                vp->box_h = bh;
+            }
+            ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        if (vp->is_dragging_view) {
+            vp->is_dragging_view = false;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+    case WM_COMMAND: {
+        switch (LOWORD(wParam)) {
+        case IDC_VP_APPLY_BOX: {
+            if (vp->has_box && vp->hwnd_target_edit) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%.2f %.2f %.2f %.2f", vp->box_x, vp->box_y, vp->box_w, vp->box_h);
+                SetWindowTextA(vp->hwnd_target_edit, buf);
+            }
+            DestroyWindow(hwnd);
+            break;
+        }
+        case IDC_VP_APPLY_VIEW: {
+            if (vp->hwnd_target_edit) {
+                float cx1, cy1, cx2, cy2;
+                vp_screen_to_canvas(vp, 0, 0, &cx1, &cy1);
+                vp_screen_to_canvas(vp, (float)vp->width, (float)(vp->height - 48), &cx2, &cy2);
+                float vx = cx1 < cx2 ? cx1 : cx2;
+                float vy = cy1 < cy2 ? cy1 : cy2;
+                float vw = fabsf(cx2 - cx1);
+                float vh = fabsf(cy2 - cy1);
+
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%.2f %.2f %.2f %.2f", vx, vy, vw, vh);
+                SetWindowTextA(vp->hwnd_target_edit, buf);
+            }
+            DestroyWindow(hwnd);
+            break;
+        }
+        case IDC_VP_CANCEL:
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        vp_render(vp);
+
+        if (vp->surface) {
+            int w = plutovg_surface_get_width(vp->surface);
+            int h = plutovg_surface_get_height(vp->surface);
+            const unsigned char* data = plutovg_surface_get_data(vp->surface);
+
+            BITMAPINFO bmi = {0};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, data, &bmi, DIB_RGB_COLORS, SRCCOPY);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY: {
+        free_svg_doc(&vp->svg);
+        registry_init(&vp->registry);
+        if (vp->canvas) plutovg_canvas_destroy(vp->canvas);
+        if (vp->surface) plutovg_surface_destroy(vp->surface);
+        vp->canvas = NULL;
+        vp->surface = NULL;
+        return 0;
+    }
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void open_destination_viewport_picker(HWND parent, const char* target_url, HWND hwnd_target_edit) {
+    char clean_path[MAX_PATH];
+    const char* url_str = target_url;
+    if (_strnicmp(url_str, "file:///", 8) == 0) url_str += 8;
+    else if (_strnicmp(url_str, "file://", 7) == 0) url_str += 7;
+
+    strncpy(clean_path, url_str, MAX_PATH - 1);
+    for (char* p = clean_path; *p; ++p) {
+        if (*p == '/') *p = '\\';
+    }
+
+    if (GetFileAttributesA(clean_path) == INVALID_FILE_ATTRIBUTES) {
+        if (!browse_file(parent, "SVG Files (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", clean_path, sizeof(clean_path), false, "svg")) {
+            return;
+        }
+    }
+
+    static bool s_registered = false;
+    if (!s_registered) {
+        WNDCLASSEXA wc = { sizeof(wc) };
+        wc.lpfnWndProc = ViewportPickerWndProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_CROSS);
+        wc.lpszClassName = "PlutoVGViewportPickerClass";
+        RegisterClassExA(&wc);
+        s_registered = true;
+    }
+
+    ViewportPicker* vp = &g_vp_picker;
+    memset(vp, 0, sizeof(ViewportPicker));
+    strncpy(vp->svg_path, clean_path, MAX_PATH - 1);
+    vp->hwnd_target_edit = hwnd_target_edit;
+
+    discover_fonts_for_svg(&vp->registry, vp->fonts_dir, sizeof(vp->fonts_dir), clean_path);
+    parse_svg_document(&vp->svg, clean_path);
+
+    HWND hwnd_picker = CreateWindowExA(
+        WS_EX_TOPMOST,
+        "PlutoVGViewportPickerClass",
+        "Select Destination Viewport (Drag Box with Left Mouse, Pan with Right Mouse)",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 900, 680,
+        parent, NULL, GetModuleHandle(NULL), NULL
+    );
+    vp->hwnd = hwnd_picker;
+
+    RECT rc;
+    GetClientRect(hwnd_picker, &rc);
+    vp->width = rc.right;
+    vp->height = rc.bottom;
+    vp->zoom = 1.0f;
+    if (vp->svg.width > 0 && vp->svg.height > 0) {
+        float sx = ((float)vp->width * 0.85f) / vp->svg.width;
+        float sy = ((float)vp->height * 0.85f) / vp->svg.height;
+        vp->zoom = (sx < sy) ? sx : sy;
+    }
+    vp->pan_x = ((float)vp->width - (vp->svg.width * vp->zoom)) / 2.0f;
+    vp->pan_y = ((float)vp->height - (vp->svg.height * vp->zoom)) / 2.0f;
+
+    // Controls Toolbar at bottom
+    CreateWindowA("BUTTON", "Apply Selected Box", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                  20, vp->height - 42, 170, 30, hwnd_picker, (HMENU)IDC_VP_APPLY_BOX, NULL, NULL);
+    CreateWindowA("BUTTON", "Apply Current View", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                  200, vp->height - 42, 170, 30, hwnd_picker, (HMENU)IDC_VP_APPLY_VIEW, NULL, NULL);
+    CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                  380, vp->height - 42, 100, 30, hwnd_picker, (HMENU)IDC_VP_CANCEL, NULL, NULL);
+}
+
+// --- URL Link Editing Dialog (Problem c) ---
+
 static LRESULT CALLBACK UrlLinkDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static YoloAnnotation* s_annot = NULL;
 
@@ -1525,18 +1981,10 @@ static LRESULT CALLBACK UrlLinkDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             }
             break;
         }
-        case IDC_DLG_BTN_CAPTURE: {
-            float cx1, cy1, cx2, cy2;
-            screen_to_canvas(&g_app, 0, 0, &cx1, &cy1);
-            screen_to_canvas(&g_app, (float)g_app.width, (float)g_app.height, &cx2, &cy2);
-            float bx = cx1 < cx2 ? cx1 : cx2;
-            float by = cy1 < cy2 ? cy1 : cy2;
-            float bw = fabsf(cx2 - cx1);
-            float bh = fabsf(cy2 - cy1);
-
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%.2f %.2f %.2f %.2f", bx, by, bw, bh);
-            SetDlgItemTextA(hwnd, IDC_DLG_VIEWPORT_EDIT, buf);
+        case IDC_DLG_BTN_PICK_VIEWPORT: {
+            char target_url[MAX_PATH];
+            GetDlgItemTextA(hwnd, IDC_DLG_URL_EDIT, target_url, sizeof(target_url));
+            open_destination_viewport_picker(hwnd, target_url, GetDlgItem(hwnd, IDC_DLG_VIEWPORT_EDIT));
             break;
         }
         case IDC_DLG_BTN_OK: {
@@ -1560,6 +2008,8 @@ static LRESULT CALLBACK UrlLinkDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 } else {
                     s_annot->has_dest_viewport = false;
                 }
+                g_app.is_dirty = true;
+                update_window_title();
                 log_append("[ANNOT] Configured URLLink: url='%s', viewport=%s",
                            s_annot->url, s_annot->has_dest_viewport ? vp_text : "(scale to fit)");
             }
@@ -1600,24 +2050,23 @@ static void open_urllink_dialog(HWND parent, YoloAnnotation* a) {
         "PlutoVGUrlLinkDlgClass",
         "Edit URL Link Annotation",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 520, 260,
+        CW_USEDEFAULT, CW_USEDEFAULT, 540, 270,
         parent, NULL, GetModuleHandle(NULL), NULL
     );
 
     SetWindowLongPtr(hwnd_dlg, GWLP_USERDATA, (LONG_PTR)a);
 
-    // Dialog Child Controls
     CreateWindowA("STATIC", "Target URL (e.g. file://c:/example.svg or https://...):",
-                  WS_CHILD | WS_VISIBLE, 20, 16, 460, 18, hwnd_dlg, NULL, NULL, NULL);
+                  WS_CHILD | WS_VISIBLE, 20, 16, 480, 18, hwnd_dlg, NULL, NULL, NULL);
 
     HWND hUrlEdit = CreateWindowA("EDIT", a->url, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                                  20, 38, 360, 24, hwnd_dlg, (HMENU)IDC_DLG_URL_EDIT, NULL, NULL);
+                                  20, 38, 380, 24, hwnd_dlg, (HMENU)IDC_DLG_URL_EDIT, NULL, NULL);
 
     CreateWindowA("BUTTON", "Browse...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  390, 38, 90, 24, hwnd_dlg, (HMENU)IDC_DLG_BTN_BROWSE, NULL, NULL);
+                  410, 38, 90, 24, hwnd_dlg, (HMENU)IDC_DLG_BTN_BROWSE, NULL, NULL);
 
     CreateWindowA("STATIC", "Destination Viewport BBox [x y w h] (Optional):",
-                  WS_CHILD | WS_VISIBLE, 20, 78, 460, 18, hwnd_dlg, NULL, NULL, NULL);
+                  WS_CHILD | WS_VISIBLE, 20, 78, 480, 18, hwnd_dlg, NULL, NULL, NULL);
 
     char vp_str[128] = "";
     if (a->has_dest_viewport) {
@@ -1625,15 +2074,16 @@ static void open_urllink_dialog(HWND parent, YoloAnnotation* a) {
                  a->dest_viewport[0], a->dest_viewport[1], a->dest_viewport[2], a->dest_viewport[3]);
     }
     HWND hVpEdit = CreateWindowA("EDIT", vp_str, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                                 20, 100, 280, 24, hwnd_dlg, (HMENU)IDC_DLG_VIEWPORT_EDIT, NULL, NULL);
+                                 20, 100, 220, 24, hwnd_dlg, (HMENU)IDC_DLG_VIEWPORT_EDIT, NULL, NULL);
 
-    CreateWindowA("BUTTON", "Capture Current View", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  310, 100, 170, 24, hwnd_dlg, (HMENU)IDC_DLG_BTN_CAPTURE, NULL, NULL);
+    // Problem c Fix: Launch Visual Viewport Picker
+    CreateWindowA("BUTTON", "Select Viewport on SVG...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                  250, 100, 250, 24, hwnd_dlg, (HMENU)IDC_DLG_BTN_PICK_VIEWPORT, NULL, NULL);
 
     CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                  290, 165, 90, 28, hwnd_dlg, (HMENU)IDC_DLG_BTN_OK, NULL, NULL);
+                  310, 175, 90, 28, hwnd_dlg, (HMENU)IDC_DLG_BTN_OK, NULL, NULL);
     CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                  390, 165, 90, 28, hwnd_dlg, (HMENU)IDC_DLG_BTN_CANCEL, NULL, NULL);
+                  410, 175, 90, 28, hwnd_dlg, (HMENU)IDC_DLG_BTN_CANCEL, NULL, NULL);
 
     HFONT hSysFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     SendMessageA(hUrlEdit, WM_SETFONT, (WPARAM)hSysFont, TRUE);
@@ -1669,10 +2119,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_app.show_grid = true;
         g_app.zoom = 1.0f;
         g_app.interaction_mode = APP_MODE_NAVIGATE;
-        g_app.annotations_selectable = true; // Thing B: Selectable by default
+        g_app.annotations_selectable = true;
         g_app.active_class_id = 0;
         g_app.selected_annotation_idx = -1;
-        load_system_mono_font(&g_app); // Thing A
+        load_system_mono_font(&g_app);
         return 0;
     }
 
@@ -1716,7 +2166,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.drag_curr_canvas_x = cx;
             g_app.drag_curr_canvas_y = cy;
         } else if (g_app.annotations_selectable) {
-            // Thing B: Check handles / boxes only if annotations_selectable is true
             ResizeHandle handle = HANDLE_NONE;
             int hit = hit_test_annotations(&g_app, cx, cy, &handle);
 
@@ -1733,7 +2182,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_app.last_mouse.y = my;
             }
         } else {
-            // Annotations Locked / Non-selectable -> Panning Only (Thing B)
             g_app.selected_annotation_idx = -1;
             g_app.is_dragging_view = true;
             g_app.last_mouse.x = mx;
@@ -1772,6 +2220,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             g_app.drag_start_canvas_x = cx;
             g_app.drag_start_canvas_y = cy;
+            g_app.is_dirty = true;
+            update_window_title();
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (g_app.is_dragging_view) {
             g_app.pan_x += (float)(mx - g_app.last_mouse.x);
@@ -1802,6 +2252,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 update_annotation_normalized(&g_app, a, x1 < x2 ? x1 : x2, y1 < y2 ? y1 : y2, bw, bh);
                 g_app.selected_annotation_idx = g_app.annotation_count - 1;
 
+                g_app.is_dirty = true;
+                update_window_title();
+
                 if (a->class_id == 8) {
                     open_urllink_dialog(hwnd, a);
                 } else {
@@ -1818,7 +2271,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
-    case WM_LBUTTONDBLCLK: { // Double Click Launch / Edit (Thing C)
+    case WM_LBUTTONDBLCLK: {
         int mx = GET_X_LPARAM(lParam);
         int my = GET_Y_LPARAM(lParam);
         float cx, cy;
@@ -1921,7 +2374,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (DragQueryFileA(hDrop, 0, file, MAX_PATH)) {
             const char* ext = PathFindExtensionA(file);
             if (_stricmp(ext, ".svg") == 0) {
-                load_svg_file(&g_app, file);
+                if (check_save_changes_prompt(hwnd)) {
+                    load_svg_file(&g_app, file);
+                }
             } else if (_stricmp(ext, ".yaml") == 0 || _stricmp(ext, ".yml") == 0) {
                 load_yolo_annotations(&g_app, file);
             } else if (_stricmp(ext, ".ttf") == 0 || _stricmp(ext, ".otf") == 0) {
@@ -1942,6 +2397,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 YoloAnnotation* a = &g_app.annotations[g_app.selected_annotation_idx];
                 a->class_id = cid;
                 strncpy(a->class_name, DEFAULT_CATEGORIES[cid].name, sizeof(a->class_name) - 1);
+                g_app.is_dirty = true;
+                update_window_title();
             }
             log_append("[ANNOT] Active Class set to: [%d] %s", cid, DEFAULT_CATEGORIES[cid].name);
             InvalidateRect(hwnd, NULL, FALSE);
@@ -1950,6 +2407,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         switch (cmd) {
         case ID_MENU_OPEN_SVG: {
+            if (!check_save_changes_prompt(hwnd)) break;
             char path[MAX_PATH];
             if (browse_file(hwnd, "Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0", path, sizeof(path), false, "svg")) {
                 load_svg_file(&g_app, path);
@@ -1988,18 +2446,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         }
-        case ID_MENU_TOGGLE_SELECTABLE: { // Thing B
+        case ID_MENU_TOGGLE_SELECTABLE: {
             g_app.annotations_selectable = !g_app.annotations_selectable;
             CheckMenuItem(GetMenu(hwnd), ID_MENU_TOGGLE_SELECTABLE, g_app.annotations_selectable ? MF_CHECKED : MF_UNCHECKED);
             if (!g_app.annotations_selectable) {
                 g_app.selected_annotation_idx = -1;
             }
-            log_append("[MODE] Annotations Selectable: %s (When OFF, pointer device will only Pan)",
-                       g_app.annotations_selectable ? "ON" : "OFF");
+            log_append("[MODE] Annotations Selectable: %s", g_app.annotations_selectable ? "ON" : "OFF");
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         }
-        case ID_MENU_EDIT_URLLINK: { // Thing C
+        case ID_MENU_EDIT_URLLINK: {
             if (g_app.selected_annotation_idx >= 0 && g_app.selected_annotation_idx < g_app.annotation_count) {
                 open_urllink_dialog(hwnd, &g_app.annotations[g_app.selected_annotation_idx]);
             } else {
@@ -2015,6 +2472,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
                 g_app.annotation_count--;
                 g_app.selected_annotation_idx = -1;
+                g_app.is_dirty = true;
+                update_window_title();
                 log_append("[ANNOT] Deleted annotation.");
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -2023,6 +2482,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case ID_MENU_CLEAR_ANNOT: {
             g_app.annotation_count = 0;
             g_app.selected_annotation_idx = -1;
+            g_app.is_dirty = true;
+            update_window_title();
             log_append("[ANNOT] Cleared all annotations.");
             InvalidateRect(hwnd, NULL, FALSE);
             break;
@@ -2063,7 +2524,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         case ID_MENU_EXIT:
-            DestroyWindow(hwnd);
+            SendMessage(hwnd, WM_CLOSE, 0, 0);
             break;
         }
         return 0;
@@ -2095,6 +2556,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_ERASEBKGND:
         return 1;
+
+    case WM_CLOSE: // Problem b: Check unsaved work on close
+        if (!check_save_changes_prompt(hwnd)) return 0;
+        DestroyWindow(hwnd);
+        return 0;
 
     case WM_DESTROY:
         free_svg_doc(&g_app.svg);
@@ -2172,7 +2638,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     WNDCLASSEXA wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXA);
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS; // Enabled double clicks
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -2234,7 +2700,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     create_app_menu(g_app.hwnd_main);
 
-    // Accelerators
     ACCEL accels[] = {
         { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
         { FCONTROL | FVIRTKEY, 'S', ID_MENU_SAVE_ANNOT },
@@ -2260,7 +2725,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(g_app.hwnd_main, nCmdShow);
     UpdateWindow(g_app.hwnd_main);
 
-    // Command line handling including --bbox target viewport
     int argc = 0;
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argvW && argc > 1) {
