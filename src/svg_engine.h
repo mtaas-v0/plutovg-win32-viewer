@@ -9,6 +9,7 @@
 #define MAX_FONTS         64
 #define MAX_SVG_NODES     16384
 #define MAX_GROUP_DEPTH   64
+#define MAX_DASH_COUNT    16
 
 typedef enum {
     SVG_NODE_PATH,
@@ -34,11 +35,17 @@ typedef struct {
     bool has_fill;
     plutovg_color_t fill_color;
     plutovg_fill_rule_t fill_rule;
+
     bool has_stroke;
     plutovg_color_t stroke_color;
     float stroke_width;
     plutovg_line_join_t stroke_join;
     plutovg_line_cap_t stroke_cap;
+
+    bool has_dash;
+    float dash_array[MAX_DASH_COUNT];
+    int dash_count;
+    float dash_offset;
 
     plutovg_path_t* path;
 
@@ -71,7 +78,7 @@ void SvgDocument_Free(SvgDocument* doc);
 // Rendering
 void SvgDocument_Render(const SvgDocument* doc, plutovg_canvas_t* canvas);
 
-// Standalone Vector Export (Converts fonts & glyphs to paths)
+// Standalone Vector Export
 bool SvgDocument_ExportWithEmbeddedPaths(const SvgDocument* doc, const char* out_path, SvgLogCallback log_cb);
 
 // Font Discovery & Lookup
