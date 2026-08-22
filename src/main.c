@@ -175,12 +175,14 @@ typedef struct {
     HWND hwnd_log_edit;
     HFONT hfont_log;
 
+    // Viewport
     float zoom;
     float pan_x;
     float pan_y;
     float rotation_deg;
     float shear_x;
 
+    // Mouse Interaction
     bool is_dragging_view;
     bool is_drawing_box;
     bool is_transforming_box;
@@ -191,6 +193,7 @@ typedef struct {
     float drag_curr_canvas_x;
     float drag_curr_canvas_y;
 
+    // Annotation Data & Settings
     AppInteractionMode interaction_mode;
     bool annotations_selectable;
     bool is_dirty;
@@ -200,11 +203,13 @@ typedef struct {
     int active_class_id;
     char annot_file_path[MAX_PATH];
 
+    // Canvas Surface
     int width;
     int height;
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
 
+    // Fonts & SVG
     char current_svg_path[MAX_PATH];
     char current_svg_name[128];
     char fonts_dir[MAX_PATH];
@@ -869,6 +874,7 @@ static const char* find_attr_slice(const char* tag_start, const char* tag_end, c
 static const char* find_prop_slice(const char* tag_start, const char* tag_end, const char* prop_name, size_t* out_len) {
     if (!tag_start || !tag_end || tag_start >= tag_end || !prop_name) return NULL;
 
+    // 1. Direct attribute: prop="val"
     size_t direct_len = 0;
     const char* direct_val = find_attr_slice(tag_start, tag_end, prop_name, &direct_len);
     if (direct_val && direct_len > 0) {
@@ -876,6 +882,7 @@ static const char* find_prop_slice(const char* tag_start, const char* tag_end, c
         return direct_val;
     }
 
+    // 2. CSS inline style: style="...; prop: val; ..."
     size_t style_len = 0;
     const char* style_str = find_attr_slice(tag_start, tag_end, "style", &style_len);
     if (style_str && style_len > 0) {
@@ -911,6 +918,7 @@ static const char* find_prop_slice(const char* tag_start, const char* tag_end, c
     return NULL;
 }
 
+// Complete SVG Transform Matrix Parser (handles matrix, translate, scale, 3-param rotate, skewX, skewY)
 static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* out_mat) {
     plutovg_matrix_init_identity(out_mat);
     if (!str || len == 0) return;
@@ -922,63 +930,87 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
         while (p < end && (isspace((unsigned char)*p) || *p == ',')) p++;
         if (p >= end) break;
 
-        if (p + 6 <= end && strncmp(p, "matrix", 6) == 0) {
-            const char* lp = (const char*)memchr(p, '(', (size_t)(end - p));
-            const char* rp = lp ? (const char*)memchr(lp, ')', (size_t)(end - lp)) : NULL;
-            if (lp && rp && rp > lp) {
-                float a, b, c, d, e, f;
-                char buf[128];
-                size_t arg_len = (size_t)(rp - (lp + 1));
-                if (arg_len < sizeof(buf)) {
-                    strncpy(buf, lp + 1, arg_len);
-                    buf[arg_len] = '\0';
-                    for (size_t i = 0; i < arg_len; ++i) if (buf[i] == ',') buf[i] = ' ';
-                    if (sscanf(buf, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f) == 6) {
-                        plutovg_matrix_t m;
-                        plutovg_matrix_init(&m, a, b, c, d, e, f);
-                        plutovg_matrix_multiply(out_mat, out_mat, &m);
-                    }
-                }
-                p = rp + 1;
-            } else { p++; }
-        } else if (p + 5 <= end && strncmp(p, "scale", 5) == 0) {
-            const char* lp = (const char*)memchr(p, '(', (size_t)(end - p));
-            const char* rp = lp ? (const char*)memchr(lp, ')', (size_t)(end - lp)) : NULL;
-            if (lp && rp && rp > lp) {
-                float sx = 1.0f, sy = 1.0f;
-                char buf[128];
-                size_t arg_len = (size_t)(rp - (lp + 1));
-                if (arg_len < sizeof(buf)) {
-                    strncpy(buf, lp + 1, arg_len);
-                    buf[arg_len] = '\0';
-                    for (size_t i = 0; i < arg_len; ++i) if (buf[i] == ',') buf[i] = ' ';
-                    int cnt = sscanf(buf, "%f %f", &sx, &sy);
-                    if (cnt == 1) sy = sx;
-                    plutovg_matrix_t m;
-                    plutovg_matrix_init_scale(&m, sx, sy);
-                    plutovg_matrix_multiply(out_mat, out_mat, &m);
-                }
-                p = rp + 1;
-            } else { p++; }
-        } else if (p + 9 <= end && strncmp(p, "translate", 9) == 0) {
-            const char* lp = (const char*)memchr(p, '(', (size_t)(end - p));
-            const char* rp = lp ? (const char*)memchr(lp, ')', (size_t)(end - lp)) : NULL;
-            if (lp && rp && rp > lp) {
-                float tx = 0.0f, ty = 0.0f;
-                char buf[128];
-                size_t arg_len = (size_t)(rp - (lp + 1));
-                if (arg_len < sizeof(buf)) {
-                    strncpy(buf, lp + 1, arg_len);
-                    buf[arg_len] = '\0';
-                    for (size_t i = 0; i < arg_len; ++i) if (buf[i] == ',') buf[i] = ' ';
-                    sscanf(buf, "%f %f", &tx, &ty);
-                    plutovg_matrix_t m;
-                    plutovg_matrix_init_translate(&m, tx, ty);
-                    plutovg_matrix_multiply(out_mat, out_mat, &m);
-                }
-                p = rp + 1;
-            } else { p++; }
-        } else p++;
+        const char* lp = (const char*)memchr(p, '(', (size_t)(end - p));
+        if (!lp) break;
+        const char* rp = (const char*)memchr(lp, ')', (size_t)(end - lp));
+        if (!rp) break;
+
+        size_t name_len = (size_t)(lp - p);
+        while (name_len > 0 && isspace((unsigned char)p[name_len - 1])) name_len--;
+
+        char name[32];
+        if (name_len >= sizeof(name)) name_len = sizeof(name) - 1;
+        strncpy(name, p, name_len);
+        name[name_len] = '\0';
+
+        char buf[256];
+        size_t arg_len = (size_t)(rp - (lp + 1));
+        if (arg_len >= sizeof(buf)) arg_len = sizeof(buf) - 1;
+        strncpy(buf, lp + 1, arg_len);
+        buf[arg_len] = '\0';
+
+        for (size_t i = 0; i < arg_len; ++i) {
+            if (buf[i] == ',') buf[i] = ' ';
+        }
+
+        plutovg_matrix_t m;
+        plutovg_matrix_init_identity(&m);
+
+        if (_stricmp(name, "matrix") == 0) {
+            float a, b, c, d, e, f;
+            if (sscanf(buf, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f) == 6) {
+                plutovg_matrix_init(&m, a, b, c, d, e, f);
+                plutovg_matrix_multiply(out_mat, out_mat, &m);
+            }
+        } else if (_stricmp(name, "translate") == 0) {
+            float tx = 0.0f, ty = 0.0f;
+            int count = sscanf(buf, "%f %f", &tx, &ty);
+            if (count >= 1) {
+                plutovg_matrix_init_translate(&m, tx, ty);
+                plutovg_matrix_multiply(out_mat, out_mat, &m);
+            }
+        } else if (_stricmp(name, "scale") == 0) {
+            float sx = 1.0f, sy = 1.0f;
+            int count = sscanf(buf, "%f %f", &sx, &sy);
+            if (count == 1) sy = sx;
+            if (count >= 1) {
+                plutovg_matrix_init_scale(&m, sx, sy);
+                plutovg_matrix_multiply(out_mat, out_mat, &m);
+            }
+        } else if (_stricmp(name, "rotate") == 0) {
+            float angle = 0.0f, cx = 0.0f, cy = 0.0f;
+            int count = sscanf(buf, "%f %f %f", &angle, &cx, &cy);
+            float rad = angle * (3.14159265358979323846f / 180.0f);
+            if (count == 3) {
+                // rotate(angle, cx, cy) = translate(cx, cy) * rotate(angle) * translate(-cx, -cy)
+                plutovg_matrix_t t1, r, t2;
+                plutovg_matrix_init_translate(&t1, cx, cy);
+                plutovg_matrix_init_rotate(&r, rad);
+                plutovg_matrix_init_translate(&t2, -cx, -cy);
+                plutovg_matrix_multiply(&m, &t1, &r);
+                plutovg_matrix_multiply(&m, &m, &t2);
+                plutovg_matrix_multiply(out_mat, out_mat, &m);
+            } else if (count >= 1) {
+                plutovg_matrix_init_rotate(&m, rad);
+                plutovg_matrix_multiply(out_mat, out_mat, &m);
+            }
+        } else if (_stricmp(name, "skewX") == 0) {
+            float angle = 0.0f;
+            if (sscanf(buf, "%f", &angle) == 1) {
+                float rad = angle * (3.14159265358979323846f / 180.0f);
+                plutovg_matrix_init_shear(&m, tanf(rad), 0.0f);
+                plutovg_matrix_multiply(out_mat, out_mat, &m);
+            }
+        } else if (_stricmp(name, "skewY") == 0) {
+            float angle = 0.0f;
+            if (sscanf(buf, "%f", &angle) == 1) {
+                float rad = angle * (3.14159265358979323846f / 180.0f);
+                plutovg_matrix_init_shear(&m, 0.0f, tanf(rad));
+                plutovg_matrix_multiply(out_mat, out_mat, &m);
+            }
+        }
+
+        p = rp + 1;
     }
 }
 
@@ -1096,35 +1128,91 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
     doc->width = 600.0f;
     doc->height = 400.0f;
 
-    size_t val_len = 0;
-    const char* val_ptr = NULL;
-
-    const char* root_svg = strstr(buffer, "<svg");
-    if (root_svg) {
-        const char* root_end = strchr(root_svg, '>');
-        if (root_end) {
-            if ((val_ptr = find_prop_slice(root_svg, root_end, "width", &val_len))) doc->width = (float)atof(val_ptr);
-            if ((val_ptr = find_prop_slice(root_svg, root_end, "height", &val_len))) doc->height = (float)atof(val_ptr);
-        }
-    }
-
     SvgGroupState group_stack[MAX_GROUP_DEPTH];
     int group_depth = 0;
     memset(&group_stack[0], 0, sizeof(SvgGroupState));
     plutovg_matrix_init_identity(&group_stack[0].matrix);
+
+    size_t val_len = 0;
+    const char* val_ptr = NULL;
+
+    // Parse Root <svg ...> viewBox & Viewport Transformation
+    const char* root_svg = strstr(buffer, "<svg");
+    if (root_svg) {
+        const char* root_end = strchr(root_svg, '>');
+        if (root_end) {
+            float doc_w = 0.0f, doc_h = 0.0f;
+            if ((val_ptr = find_prop_slice(root_svg, root_end, "width", &val_len))) doc_w = (float)atof(val_ptr);
+            if ((val_ptr = find_prop_slice(root_svg, root_end, "height", &val_len))) doc_h = (float)atof(val_ptr);
+
+            float vb_x = 0, vb_y = 0, vb_w = 0, vb_h = 0;
+            bool has_viewbox = false;
+            if ((val_ptr = find_prop_slice(root_svg, root_end, "viewBox", &val_len))) {
+                char vb_buf[128];
+                if (val_len < sizeof(vb_buf)) {
+                    strncpy(vb_buf, val_ptr, val_len);
+                    vb_buf[val_len] = '\0';
+                    for (size_t i = 0; i < val_len; ++i) if (vb_buf[i] == ',') vb_buf[i] = ' ';
+                    if (sscanf(vb_buf, "%f %f %f %f", &vb_x, &vb_y, &vb_w, &vb_h) == 4 && vb_w > 0 && vb_h > 0) {
+                        has_viewbox = true;
+                    }
+                }
+            }
+
+            if (has_viewbox) {
+                if (doc_w <= 0 || doc_h <= 0) {
+                    doc->width = vb_w;
+                    doc->height = vb_h;
+                    plutovg_matrix_init_translate(&group_stack[0].matrix, -vb_x, -vb_y);
+                } else {
+                    doc->width = doc_w;
+                    doc->height = doc_h;
+                    float sx = doc_w / vb_w;
+                    float sy = doc_h / vb_h;
+                    plutovg_matrix_init(&group_stack[0].matrix, sx, 0, 0, sy, -vb_x * sx, -vb_y * sy);
+                }
+            } else {
+                if (doc_w > 0) doc->width = doc_w;
+                if (doc_h > 0) doc->height = doc_h;
+            }
+        }
+    }
 
     const char* cur = buffer;
     while (*cur && doc->node_count < MAX_SVG_NODES) {
         const char* tag_open = strchr(cur, '<');
         if (!tag_open) break;
 
+        // Skip XML comments
         if (strncmp(tag_open, "<!--", 4) == 0) {
             const char* end_cmt = strstr(tag_open, "-->");
             cur = end_cmt ? end_cmt + 3 : tag_open + 4;
             continue;
         }
 
-        // Group handling <g ...> and </g>
+        // Skip non-rendering containers (<defs>, <clipPath>, <mask, <pattern, <symbol)
+        if (strncmp(tag_open, "<defs", 5) == 0 || strncmp(tag_open, "<clipPath", 9) == 0 ||
+            strncmp(tag_open, "<mask", 5) == 0 || strncmp(tag_open, "<pattern", 8) == 0 ||
+            strncmp(tag_open, "<symbol", 7) == 0) {
+            const char* tag_end = strchr(tag_open, '>');
+            if (tag_end) {
+                if (*(tag_end - 1) == '/') { cur = tag_end + 1; continue; }
+                const char* close_tag = NULL;
+                if (strncmp(tag_open, "<defs", 5) == 0) close_tag = strstr(tag_end, "</defs>");
+                else if (strncmp(tag_open, "<clipPath", 9) == 0) close_tag = strstr(tag_end, "</clipPath>");
+                else if (strncmp(tag_open, "<mask", 5) == 0) close_tag = strstr(tag_end, "</mask>");
+                else if (strncmp(tag_open, "<pattern", 8) == 0) close_tag = strstr(tag_end, "</pattern>");
+                else if (strncmp(tag_open, "<symbol", 7) == 0) close_tag = strstr(tag_end, "</symbol>");
+
+                if (close_tag) {
+                    const char* close_end = strchr(close_tag, '>');
+                    cur = close_end ? close_end + 1 : close_tag + 6;
+                    continue;
+                }
+            }
+        }
+
+        // Group closing </g>
         if (strncmp(tag_open, "</g", 3) == 0 && (isspace((unsigned char)tag_open[3]) || tag_open[3] == '>')) {
             if (group_depth > 0) group_depth--;
             const char* tag_end = strchr(tag_open, '>');
@@ -1132,42 +1220,50 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             continue;
         }
 
+        // Group opening <g ...>
         if (strncmp(tag_open, "<g", 2) == 0 && (isspace((unsigned char)tag_open[2]) || tag_open[2] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
-            if (tag_end && group_depth < MAX_GROUP_DEPTH - 1) {
-                SvgGroupState* parent = &group_stack[group_depth];
-                group_depth++;
-                SvgGroupState* g = &group_stack[group_depth];
-                *g = *parent;
-
-                size_t t_len = 0;
-                const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
-                if (t_str && t_len > 0) {
-                    plutovg_matrix_t g_mat;
-                    parse_svg_transform(t_str, t_len, &g_mat);
-                    plutovg_matrix_multiply(&g->matrix, &parent->matrix, &g_mat);
+            if (tag_end) {
+                // If self-closing `<g ... />`, skip without increasing depth
+                if (*(tag_end - 1) == '/') {
+                    cur = tag_end + 1;
+                    continue;
                 }
 
-                size_t a_len = 0;
-                const char* a_str = NULL;
-                plutovg_color_t black;
-                plutovg_color_init_rgb(&black, 0, 0, 0);
+                if (group_depth < MAX_GROUP_DEPTH - 1) {
+                    SvgGroupState* parent = &group_stack[group_depth];
+                    group_depth++;
+                    SvgGroupState* g = &group_stack[group_depth];
+                    *g = *parent;
 
-                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke", &a_len))) {
-                    parse_color_slice(a_str, a_len, &g->has_stroke, &g->stroke_color, black);
-                }
-                if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-width", &a_len))) {
-                    g->has_stroke_width = true;
-                    g->stroke_width = (float)atof(a_str);
-                }
-                if ((a_str = find_prop_slice(tag_open, tag_end, "fill", &a_len))) {
-                    parse_color_slice(a_str, a_len, &g->has_fill, &g->fill_color, black);
-                }
-                if ((a_str = find_prop_slice(tag_open, tag_end, "fill-rule", &a_len))) {
-                    g->has_fill_rule = true;
-                    g->fill_rule = (a_len >= 7 && strncmp(a_str, "evenodd", 7) == 0) ? PLUTOVG_FILL_RULE_EVEN_ODD : PLUTOVG_FILL_RULE_NON_ZERO;
-                }
+                    size_t t_len = 0;
+                    const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
+                    if (t_str && t_len > 0) {
+                        plutovg_matrix_t g_mat;
+                        parse_svg_transform(t_str, t_len, &g_mat);
+                        plutovg_matrix_multiply(&g->matrix, &parent->matrix, &g_mat);
+                    }
 
+                    size_t a_len = 0;
+                    const char* a_str = NULL;
+                    plutovg_color_t black;
+                    plutovg_color_init_rgb(&black, 0, 0, 0);
+
+                    if ((a_str = find_prop_slice(tag_open, tag_end, "stroke", &a_len))) {
+                        parse_color_slice(a_str, a_len, &g->has_stroke, &g->stroke_color, black);
+                    }
+                    if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-width", &a_len))) {
+                        g->has_stroke_width = true;
+                        g->stroke_width = (float)atof(a_str);
+                    }
+                    if ((a_str = find_prop_slice(tag_open, tag_end, "fill", &a_len))) {
+                        parse_color_slice(a_str, a_len, &g->has_fill, &g->fill_color, black);
+                    }
+                    if ((a_str = find_prop_slice(tag_open, tag_end, "fill-rule", &a_len))) {
+                        g->has_fill_rule = true;
+                        g->fill_rule = (a_len >= 7 && strncmp(a_str, "evenodd", 7) == 0) ? PLUTOVG_FILL_RULE_EVEN_ODD : PLUTOVG_FILL_RULE_NON_ZERO;
+                    }
+                }
                 cur = tag_end + 1;
                 continue;
             }
@@ -1195,7 +1291,7 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             size_t a_len = 0;
             const char* a_str = NULL;
 
-            // 1. Construct Path Geometry
+            // 1. Geometry Construction
             size_t d_len = 0;
             const char* d_str = find_prop_slice(tag_open, tag_end, "d", &d_len);
 
@@ -1251,7 +1347,7 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
                 }
             }
 
-            // 2. Transform Matrix
+            // 2. Transform Matrix: Parent Group Matrix * Local Element Matrix
             size_t t_len = 0;
             const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
             plutovg_matrix_t elem_mat;
@@ -1264,7 +1360,7 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             const char* fr_str = find_prop_slice(tag_open, tag_end, "fill-rule", &fr_len);
             if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
 
-            // 4. Stroke & Fill Properties
+            // 4. Stroke & Fill Properties (Honors direct attributes, CSS styles, and group inheritance)
             node->stroke_width = group_stack[group_depth].has_stroke_width ? group_stack[group_depth].stroke_width : 1.0f;
             node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
             node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
@@ -1602,6 +1698,7 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_line_to(canvas, 5.0f, 37.0f);
     plutovg_canvas_stroke(canvas);
 
+    // Center Origin Dot
     plutovg_canvas_set_rgb(canvas, 1.0f, 0.85f, 0.2f);
     plutovg_canvas_arc(canvas, 0.0f, 0.0f, 3.5f, 0.0f, 6.2831853f, 0);
     plutovg_canvas_fill(canvas);
