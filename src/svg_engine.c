@@ -187,8 +187,8 @@ static void registry_add_font(FontRegistry* reg, const char* name_key, const cha
     if (!face) return;
 
     CachedFont* cf = &reg->fonts[reg->count++];
-    strncpy(cf->key, clean_key, sizeof(cf->key) - 1);
-    strncpy(cf->file_path, path, MAX_PATH - 1);
+    snprintf(cf->key, sizeof(cf->key), "%s", clean_key);
+    snprintf(cf->file_path, sizeof(cf->file_path), "%s", path);
     cf->face = face;
 
     if (log_cb) log_cb("  [FONT] Registered '%s' -> %s", name_key, path);
@@ -219,7 +219,7 @@ plutovg_font_face_t* SvgEngine_FindFont(const FontRegistry* reg, const char* fam
 
 void SvgEngine_DiscoverFonts(FontRegistry* reg, char* out_fonts_dir, size_t dir_len, const char* svg_path, SvgLogCallback log_cb) {
     char svg_dir[MAX_PATH];
-    strncpy(svg_dir, svg_path, MAX_PATH - 1);
+    snprintf(svg_dir, sizeof(svg_dir), "%s", svg_path);
     PathRemoveFileSpecA(svg_dir);
 
     snprintf(out_fonts_dir, dir_len, "%s\\fonts", svg_dir);
@@ -241,7 +241,7 @@ void SvgEngine_DiscoverFonts(FontRegistry* reg, char* out_fonts_dir, size_t dir_
                         snprintf(full_path, sizeof(full_path), "%s\\%s", search_folders[f], fd.cFileName);
 
                         char font_key[128];
-                        strncpy(font_key, fd.cFileName, sizeof(font_key) - 1);
+                        snprintf(font_key, sizeof(font_key), "%s", fd.cFileName);
                         PathRemoveExtensionA(font_key);
 
                         registry_add_font(reg, font_key, full_path, log_cb);
@@ -344,7 +344,6 @@ static bool is_self_closing_tag(const char* tag_open, const char* tag_end) {
     return (p > tag_open && *p == '/');
 }
 
-// Fixed Transform Concatenation Order (Pre-multiplication: M_local * M_accumulated)
 static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* out_mat) {
     plutovg_matrix_init_identity(out_mat);
     if (!str || len == 0) return;
@@ -366,13 +365,13 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
 
         char name[32];
         if (name_len >= sizeof(name)) name_len = sizeof(name) - 1;
-        strncpy(name, p, name_len);
+        memcpy(name, p, name_len);
         name[name_len] = '\0';
 
         char buf[256];
         size_t arg_len = (size_t)(rp - (lp + 1));
         if (arg_len >= sizeof(buf)) arg_len = sizeof(buf) - 1;
-        strncpy(buf, lp + 1, arg_len);
+        memcpy(buf, lp + 1, arg_len);
         buf[arg_len] = '\0';
 
         for (size_t i = 0; i < arg_len; ++i) {
@@ -384,20 +383,20 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
 
         if (_stricmp(name, "matrix") == 0) {
             float a, b, c, d, e, f;
-            if (sscanf(buf, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f) == 6) {
+            if (sscanf_s(buf, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f) == 6) {
                 plutovg_matrix_init(&m, a, b, c, d, e, f);
                 plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "translate") == 0) {
             float tx = 0.0f, ty = 0.0f;
-            int count = sscanf(buf, "%f %f", &tx, &ty);
+            int count = sscanf_s(buf, "%f %f", &tx, &ty);
             if (count >= 1) {
                 plutovg_matrix_init_translate(&m, tx, ty);
                 plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "scale") == 0) {
             float sx = 1.0f, sy = 1.0f;
-            int count = sscanf(buf, "%f %f", &sx, &sy);
+            int count = sscanf_s(buf, "%f %f", &sx, &sy);
             if (count == 1) sy = sx;
             if (count >= 1) {
                 plutovg_matrix_init_scale(&m, sx, sy);
@@ -405,10 +404,9 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
             }
         } else if (_stricmp(name, "rotate") == 0) {
             float angle = 0.0f, cx = 0.0f, cy = 0.0f;
-            int count = sscanf(buf, "%f %f %f", &angle, &cx, &cy);
+            int count = sscanf_s(buf, "%f %f %f", &angle, &cx, &cy);
             float rad = angle * (3.14159265358979323846f / 180.0f);
             if (count == 3) {
-                // rotate(angle, cx, cy) = translate(-cx, -cy) * rotate(rad) * translate(cx, cy)
                 plutovg_matrix_t t1, r, t2;
                 plutovg_matrix_init_translate(&t1, -cx, -cy);
                 plutovg_matrix_init_rotate(&r, rad);
@@ -422,14 +420,14 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
             }
         } else if (_stricmp(name, "skewX") == 0) {
             float angle = 0.0f;
-            if (sscanf(buf, "%f", &angle) == 1) {
+            if (sscanf_s(buf, "%f", &angle) == 1) {
                 float rad = angle * (3.14159265358979323846f / 180.0f);
                 plutovg_matrix_init_shear(&m, tanf(rad), 0.0f);
                 plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "skewY") == 0) {
             float angle = 0.0f;
-            if (sscanf(buf, "%f", &angle) == 1) {
+            if (sscanf_s(buf, "%f", &angle) == 1) {
                 float rad = angle * (3.14159265358979323846f / 180.0f);
                 plutovg_matrix_init_shear(&m, 0.0f, tanf(rad));
                 plutovg_matrix_multiply(out_mat, &m, out_mat);
@@ -445,7 +443,7 @@ static void parse_color_slice(const char* val, size_t len, bool* has_paint, plut
 
     char buf[64];
     if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-    strncpy(buf, val, len);
+    memcpy(buf, val, len);
     buf[len] = '\0';
 
     char* p = buf;
@@ -464,7 +462,7 @@ static void parse_color_slice(const char* val, size_t len, bool* has_paint, plut
         unsigned int r = 0, g = 0, b = 0, a = 255;
         if (blen == 3) {
             unsigned int rgb;
-            if (sscanf(p, "%3x", &rgb) == 1) {
+            if (sscanf_s(p, "%3x", &rgb) == 1) {
                 r = ((rgb >> 8) & 0xF) * 17;
                 g = ((rgb >> 4) & 0xF) * 17;
                 b = (rgb & 0xF) * 17;
@@ -473,13 +471,13 @@ static void parse_color_slice(const char* val, size_t len, bool* has_paint, plut
                 return;
             }
         } else if (blen == 6) {
-            if (sscanf(p, "%02x%02x%02x", &r, &g, &b) == 3) {
+            if (sscanf_s(p, "%02x%02x%02x", &r, &g, &b) == 3) {
                 plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
                 *has_paint = true;
                 return;
             }
         } else if (blen == 8) {
-            if (sscanf(p, "%02x%02x%02x%02x", &r, &g, &b, &a) == 4) {
+            if (sscanf_s(p, "%02x%02x%02x%02x", &r, &g, &b, &a) == 4) {
                 plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
                 *has_paint = true;
                 return;
@@ -490,10 +488,9 @@ static void parse_color_slice(const char* val, size_t len, bool* has_paint, plut
     if (_strnicmp(p, "rgb(", 4) == 0) {
         float r = 0, g = 0, b = 0;
         char cbuf[64];
-        strncpy(cbuf, p + 4, sizeof(cbuf) - 1);
-        cbuf[sizeof(cbuf) - 1] = '\0';
+        snprintf(cbuf, sizeof(cbuf), "%s", p + 4);
         for (char* cp = cbuf; *cp; ++cp) if (*cp == ',' || *cp == ')') *cp = ' ';
-        if (sscanf(cbuf, "%f %f %f", &r, &g, &b) == 3) {
+        if (sscanf_s(cbuf, "%f %f %f", &r, &g, &b) == 3) {
             plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
             *has_paint = true;
             return;
@@ -503,10 +500,9 @@ static void parse_color_slice(const char* val, size_t len, bool* has_paint, plut
     if (_strnicmp(p, "rgba(", 5) == 0) {
         float r = 0, g = 0, b = 0, a = 1.0f;
         char cbuf[64];
-        strncpy(cbuf, p + 5, sizeof(cbuf) - 1);
-        cbuf[sizeof(cbuf) - 1] = '\0';
+        snprintf(cbuf, sizeof(cbuf), "%s", p + 5);
         for (char* cp = cbuf; *cp; ++cp) if (*cp == ',' || *cp == ')') *cp = ' ';
-        if (sscanf(cbuf, "%f %f %f %f", &r, &g, &b, &a) == 4) {
+        if (sscanf_s(cbuf, "%f %f %f %f", &r, &g, &b, &a) == 4) {
             plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, a);
             *has_paint = true;
             return;
@@ -553,7 +549,7 @@ static void parse_dash_array(const char* str, size_t len, float* out_dashes, int
 
     char buf[128];
     if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-    strncpy(buf, str, len);
+    memcpy(buf, str, len);
     buf[len] = '\0';
 
     char* p = buf;
@@ -564,14 +560,15 @@ static void parse_dash_array(const char* str, size_t len, float* out_dashes, int
         if (*cp == ',') *cp = ' ';
     }
 
-    char* token = strtok(buf, " \t\r\n");
+    char* context = NULL;
+    char* token = strtok_s(buf, " \t\r\n", &context);
     int count = 0;
     while (token && count < MAX_DASH_COUNT) {
         float val = (float)atof(token);
         if (val >= 0.0f) {
             out_dashes[count++] = val;
         }
-        token = strtok(NULL, " \t\r\n");
+        token = strtok_s(NULL, " \t\r\n", &context);
     }
 
     if (count % 2 != 0 && count * 2 <= MAX_DASH_COUNT) {
@@ -637,10 +634,10 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
             if ((val_ptr = find_prop_slice(root_svg, root_end, "viewBox", &val_len))) {
                 char vb_buf[128];
                 if (val_len < sizeof(vb_buf)) {
-                    strncpy(vb_buf, val_ptr, val_len);
+                    memcpy(vb_buf, val_ptr, val_len);
                     vb_buf[val_len] = '\0';
                     for (size_t i = 0; i < val_len; ++i) if (vb_buf[i] == ',') vb_buf[i] = ' ';
-                    if (sscanf(vb_buf, "%f %f %f %f", &vb_x, &vb_y, &vb_w, &vb_h) == 4 && vb_w > 0 && vb_h > 0) {
+                    if (sscanf_s(vb_buf, "%f %f %f %f", &vb_x, &vb_y, &vb_w, &vb_h) == 4 && vb_w > 0 && vb_h > 0) {
                         has_viewbox = true;
                     }
                 }
@@ -804,7 +801,6 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
             size_t a_len = 0;
             const char* a_str = NULL;
 
-            // Geometry
             size_t d_len = 0;
             const char* d_str = find_prop_slice(tag_open, tag_end, "d", &d_len);
 
@@ -952,7 +948,7 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
 
                 if ((a_str = find_prop_slice(tag_open, tag_end, "font-family", &a_len))) {
                     size_t cplen = a_len < sizeof(node->font_family) - 1 ? a_len : sizeof(node->font_family) - 1;
-                    strncpy(node->font_family, a_str, cplen);
+                    memcpy(node->font_family, a_str, cplen);
                     node->font_family[cplen] = '\0';
                 }
                 if ((a_str = find_prop_slice(tag_open, tag_end, "font-size", &a_len))) node->font_size = (float)atof(a_str);
