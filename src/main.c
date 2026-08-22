@@ -295,10 +295,12 @@ static void update_annotation_normalized(AppState* app, YoloAnnotation* a, float
 // --- Extended YOLO YAML Serializer & Loader ---
 
 static void get_default_annot_path(const char* svg_path, char* out_yaml, size_t max_len) {
-    strncpy(out_yaml, svg_path, max_len - 1);
-    char* dot = strrchr(out_yaml, '.');
+    if (!svg_path || !out_yaml || max_len == 0) return;
+    char temp[MAX_PATH];
+    snprintf(temp, sizeof(temp), "%s", svg_path);
+    char* dot = strrchr(temp, '.');
     if (dot) *dot = '\0';
-    strncat(out_yaml, "-yoloAnnot.yaml", max_len - strlen(out_yaml) - 1);
+    snprintf(out_yaml, max_len, "%s-yoloAnnot.yaml", temp);
 }
 
 static bool save_yolo_annotations(AppState* app, const char* yaml_path) {
@@ -340,7 +342,7 @@ static bool save_yolo_annotations(AppState* app, const char* yaml_path) {
     }
 
     fclose(f);
-    strncpy(app->annot_file_path, yaml_path, MAX_PATH - 1);
+    snprintf(app->annot_file_path, sizeof(app->annot_file_path), "%s", yaml_path);
     app->is_dirty = false;
     update_window_title();
     log_append("[ANNOT] Saved %d annotations to %s", app->annotation_count, yaml_path);
@@ -378,7 +380,7 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
             if (strncmp(p, "class_id:", 9) == 0) {
                 current.class_id = atoi(p + 9);
                 if (current.class_id >= 0 && current.class_id < MAX_CATEGORIES) {
-                    strncpy(current.class_name, DEFAULT_CATEGORIES[current.class_id].name, sizeof(current.class_name) - 1);
+                    snprintf(current.class_name, sizeof(current.class_name), "%s", DEFAULT_CATEGORIES[current.class_id].name);
                 }
             } else if (strncmp(p, "class_name:", 11) == 0) {
                 char* q1 = strchr(p, '\"');
@@ -386,14 +388,14 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
                 if (q1 && q2) {
                     size_t len = q2 - (q1 + 1);
                     if (len < sizeof(current.class_name)) {
-                        strncpy(current.class_name, q1 + 1, len);
+                        memcpy(current.class_name, q1 + 1, len);
                         current.class_name[len] = '\0';
                     }
                 }
             } else if (strncmp(p, "bbox:", 5) == 0) {
                 char* b_start = strchr(p, '[');
                 if (b_start) {
-                    sscanf(b_start, "[%f, %f, %f, %f]",
+                    sscanf_s(b_start, "[%f, %f, %f, %f]",
                            &current.x_center, &current.y_center, &current.width, &current.height);
                 }
             } else if (strncmp(p, "url:", 4) == 0) {
@@ -402,7 +404,7 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
                 if (q1 && q2) {
                     size_t ulen = q2 - (q1 + 1);
                     if (ulen < sizeof(current.url)) {
-                        strncpy(current.url, q1 + 1, ulen);
+                        memcpy(current.url, q1 + 1, ulen);
                         current.url[ulen] = '\0';
                     }
                 } else {
@@ -411,14 +413,14 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
                     size_t ulen = strlen(ustart);
                     while (ulen > 0 && isspace((unsigned char)ustart[ulen - 1])) ulen--;
                     if (ulen < sizeof(current.url)) {
-                        strncpy(current.url, ustart, ulen);
+                        memcpy(current.url, ustart, ulen);
                         current.url[ulen] = '\0';
                     }
                 }
             } else if (strncmp(p, "destination_viewport_bbox:", 26) == 0) {
                 char* b_start = strchr(p, '[');
                 if (b_start) {
-                    if (sscanf(b_start, "[%f, %f, %f, %f]",
+                    if (sscanf_s(b_start, "[%f, %f, %f, %f]",
                                &current.dest_viewport[0], &current.dest_viewport[1],
                                &current.dest_viewport[2], &current.dest_viewport[3]) == 4) {
                         current.has_dest_viewport = true;
@@ -434,7 +436,7 @@ static bool load_yolo_annotations(AppState* app, const char* yaml_path) {
     }
 
     fclose(f);
-    strncpy(app->annot_file_path, yaml_path, MAX_PATH - 1);
+    snprintf(app->annot_file_path, sizeof(app->annot_file_path), "%s", yaml_path);
     app->is_dirty = false;
     update_window_title();
     log_append("[ANNOT] Auto-loaded %d annotations from %s", app->annotation_count, yaml_path);
@@ -456,7 +458,7 @@ static void launch_urllink(const YoloAnnotation* a) {
     if (_strnicmp(url_str, "file:///", 8) == 0) url_str += 8;
     else if (_strnicmp(url_str, "file://", 7) == 0) url_str += 7;
 
-    strncpy(target_file, url_str, MAX_PATH - 1);
+    snprintf(target_file, sizeof(target_file), "%s", url_str);
     for (char* p = target_file; *p; ++p) {
         if (*p == '/') *p = '\\';
     }
@@ -556,7 +558,7 @@ static void load_svg_file(AppState* app, const char* path) {
         return;
     }
 
-    strncpy(app->current_svg_path, path, MAX_PATH - 1);
+    snprintf(app->current_svg_path, sizeof(app->current_svg_path), "%s", path);
     FontHelper_GetFontName(path, app->current_svg_name, sizeof(app->current_svg_name));
     app->has_svg_loaded = true;
 
@@ -567,7 +569,7 @@ static void load_svg_file(AppState* app, const char* path) {
     } else {
         app->annotation_count = 0;
         app->selected_annotation_idx = -1;
-        strncpy(app->annot_file_path, yml_path, MAX_PATH - 1);
+        snprintf(app->annot_file_path, sizeof(app->annot_file_path), "%s", yml_path);
         app->is_dirty = false;
         update_window_title();
     }
@@ -756,7 +758,6 @@ static void render(AppState* app) {
     if (app->show_grid) draw_grid_and_origin(app->canvas);
 
     if (app->has_svg_loaded) {
-        // Isolated SVG Document Rendering
         SvgDocument_Render(&app->svg, app->canvas);
         draw_annotations(app);
     }
@@ -788,13 +789,13 @@ static bool browse_file(HWND parent, const char* filter, char* out_path, size_t 
         ofn.Flags |= OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
         ofn.lpstrDefExt = def_ext;
         if (GetSaveFileNameA(&ofn)) {
-            strncpy(out_path, buf, max_len - 1);
+            snprintf(out_path, max_len, "%s", buf);
             return true;
         }
     } else {
         ofn.Flags |= OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
         if (GetOpenFileNameA(&ofn)) {
-            strncpy(out_path, buf, max_len - 1);
+            snprintf(out_path, max_len, "%s", buf);
             return true;
         }
     }
@@ -850,7 +851,6 @@ static void vp_render(ViewportPicker* vp) {
     plutovg_canvas_translate(vp->canvas, vp->pan_x, vp->pan_y);
     plutovg_canvas_scale(vp->canvas, vp->zoom, vp->zoom);
 
-    // Render Destination SVG Artboard using isolated SVG Engine
     SvgDocument_Render(&vp->svg, vp->canvas);
 
     if (vp->is_selecting_box || vp->has_box) {
@@ -1055,7 +1055,7 @@ static void open_destination_viewport_picker(HWND parent, const char* target_url
     if (_strnicmp(url_str, "file:///", 8) == 0) url_str += 8;
     else if (_strnicmp(url_str, "file://", 7) == 0) url_str += 7;
 
-    strncpy(clean_path, url_str, MAX_PATH - 1);
+    snprintf(clean_path, sizeof(clean_path), "%s", url_str);
     for (char* p = clean_path; *p; ++p) {
         if (*p == '/') *p = '\\';
     }
@@ -1079,7 +1079,7 @@ static void open_destination_viewport_picker(HWND parent, const char* target_url
 
     ViewportPicker* vp = &g_vp_picker;
     memset(vp, 0, sizeof(ViewportPicker));
-    strncpy(vp->svg_path, clean_path, MAX_PATH - 1);
+    snprintf(vp->svg_path, sizeof(vp->svg_path), "%s", clean_path);
     vp->hwnd_target_edit = hwnd_target_edit;
 
     if (!SvgDocument_LoadFromFile(&vp->svg, clean_path, NULL)) {
@@ -1150,14 +1150,14 @@ static LRESULT CALLBACK UrlLinkDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             if (s_annot) {
                 GetDlgItemTextA(hwnd, IDC_DLG_URL_EDIT, s_annot->url, sizeof(s_annot->url));
                 s_annot->class_id = 8;
-                strncpy(s_annot->class_name, "urllink", sizeof(s_annot->class_name) - 1);
+                snprintf(s_annot->class_name, sizeof(s_annot->class_name), "%s", "urllink");
 
                 char vp_text[128] = {0};
                 GetDlgItemTextA(hwnd, IDC_DLG_VIEWPORT_EDIT, vp_text, sizeof(vp_text));
                 for (char* p = vp_text; *p; ++p) if (*p == ',' || *p == '[' || *p == ']') *p = ' ';
 
                 float vx, vy, vw, vh;
-                if (sscanf(vp_text, "%f %f %f %f", &vx, &vy, &vw, &vh) == 4) {
+                if (sscanf_s(vp_text, "%f %f %f %f", &vx, &vy, &vw, &vh) == 4) {
                     s_annot->dest_viewport[0] = vx;
                     s_annot->dest_viewport[1] = vy;
                     s_annot->dest_viewport[2] = vw;
@@ -1405,7 +1405,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 memset(a, 0, sizeof(YoloAnnotation));
                 a->id = g_app.annotation_count - 1;
                 a->class_id = g_app.active_class_id;
-                strncpy(a->class_name, DEFAULT_CATEGORIES[g_app.active_class_id].name, sizeof(a->class_name) - 1);
+                snprintf(a->class_name, sizeof(a->class_name), "%s", DEFAULT_CATEGORIES[g_app.active_class_id].name);
                 update_annotation_normalized(&g_app, a, x1 < x2 ? x1 : x2, y1 < y2 ? y1 : y2, bw, bh);
                 g_app.selected_annotation_idx = g_app.annotation_count - 1;
 
@@ -1551,7 +1551,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_app.selected_annotation_idx >= 0 && g_app.selected_annotation_idx < g_app.annotation_count) {
                 YoloAnnotation* a = &g_app.annotations[g_app.selected_annotation_idx];
                 a->class_id = cid;
-                strncpy(a->class_name, DEFAULT_CATEGORIES[cid].name, sizeof(a->class_name) - 1);
+                snprintf(a->class_name, sizeof(a->class_name), "%s", DEFAULT_CATEGORIES[cid].name);
                 g_app.is_dirty = true;
                 update_window_title();
             }
