@@ -52,7 +52,7 @@ else()
 
     install(TARGETS PlutoVGViewer DESTINATION bin)
             
-    if(MINGW)
+    if(TRUE) #MINGW
         # Get the directory of the active MinGW compiler
         get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         
