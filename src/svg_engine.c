@@ -17,6 +17,10 @@ typedef struct {
     plutovg_color_t fill_color;
     bool has_fill_rule;
     plutovg_fill_rule_t fill_rule;
+    bool has_dash;
+    float dash_array[MAX_DASH_COUNT];
+    int dash_count;
+    float dash_offset;
 } SvgGroupState;
 
 typedef struct {
@@ -145,7 +149,7 @@ static int clean_and_unescape_text(const char* src, size_t src_len, char* dst, s
     return (int)d;
 }
 
-// --- Font Lookup Registry ---
+// --- Font Registry ---
 
 static void sanitize_key(const char* src, char* dst, size_t dst_len) {
     size_t j = 0;
@@ -276,7 +280,7 @@ static const char* find_attr_slice(const char* tag_start, const char* tag_end, c
                     const char* val_start = quote + 1;
                     const char* val_end = val_start;
                     while (val_end < tag_end && *val_end != qchar) val_end++;
-                    if (val_end <= tag_end) {
+                    if (val_end < tag_end && *val_end == qchar) {
                         *out_len = (size_t)(val_end - val_start);
                         return val_start;
                     }
@@ -340,6 +344,7 @@ static bool is_self_closing_tag(const char* tag_open, const char* tag_end) {
     return (p > tag_open && *p == '/');
 }
 
+// Fixed Transform Concatenation Order (Pre-multiplication: M_local * M_accumulated)
 static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* out_mat) {
     plutovg_matrix_init_identity(out_mat);
     if (!str || len == 0) return;
@@ -381,14 +386,14 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
             float a, b, c, d, e, f;
             if (sscanf(buf, "%f %f %f %f %f %f", &a, &b, &c, &d, &e, &f) == 6) {
                 plutovg_matrix_init(&m, a, b, c, d, e, f);
-                plutovg_matrix_multiply(out_mat, out_mat, &m);
+                plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "translate") == 0) {
             float tx = 0.0f, ty = 0.0f;
             int count = sscanf(buf, "%f %f", &tx, &ty);
             if (count >= 1) {
                 plutovg_matrix_init_translate(&m, tx, ty);
-                plutovg_matrix_multiply(out_mat, out_mat, &m);
+                plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "scale") == 0) {
             float sx = 1.0f, sy = 1.0f;
@@ -396,37 +401,38 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
             if (count == 1) sy = sx;
             if (count >= 1) {
                 plutovg_matrix_init_scale(&m, sx, sy);
-                plutovg_matrix_multiply(out_mat, out_mat, &m);
+                plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "rotate") == 0) {
             float angle = 0.0f, cx = 0.0f, cy = 0.0f;
             int count = sscanf(buf, "%f %f %f", &angle, &cx, &cy);
             float rad = angle * (3.14159265358979323846f / 180.0f);
             if (count == 3) {
+                // rotate(angle, cx, cy) = translate(-cx, -cy) * rotate(rad) * translate(cx, cy)
                 plutovg_matrix_t t1, r, t2;
-                plutovg_matrix_init_translate(&t1, cx, cy);
+                plutovg_matrix_init_translate(&t1, -cx, -cy);
                 plutovg_matrix_init_rotate(&r, rad);
-                plutovg_matrix_init_translate(&t2, -cx, -cy);
+                plutovg_matrix_init_translate(&t2, cx, cy);
                 plutovg_matrix_multiply(&m, &t1, &r);
                 plutovg_matrix_multiply(&m, &m, &t2);
-                plutovg_matrix_multiply(out_mat, out_mat, &m);
+                plutovg_matrix_multiply(out_mat, &m, out_mat);
             } else if (count >= 1) {
                 plutovg_matrix_init_rotate(&m, rad);
-                plutovg_matrix_multiply(out_mat, out_mat, &m);
+                plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "skewX") == 0) {
             float angle = 0.0f;
             if (sscanf(buf, "%f", &angle) == 1) {
                 float rad = angle * (3.14159265358979323846f / 180.0f);
                 plutovg_matrix_init_shear(&m, tanf(rad), 0.0f);
-                plutovg_matrix_multiply(out_mat, out_mat, &m);
+                plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         } else if (_stricmp(name, "skewY") == 0) {
             float angle = 0.0f;
             if (sscanf(buf, "%f", &angle) == 1) {
                 float rad = angle * (3.14159265358979323846f / 180.0f);
                 plutovg_matrix_init_shear(&m, 0.0f, tanf(rad));
-                plutovg_matrix_multiply(out_mat, out_mat, &m);
+                plutovg_matrix_multiply(out_mat, &m, out_mat);
             }
         }
 
@@ -540,6 +546,44 @@ static void parse_color_slice(const char* val, size_t len, bool* has_paint, plut
     }
 }
 
+static void parse_dash_array(const char* str, size_t len, float* out_dashes, int* out_count, float* out_offset) {
+    *out_count = 0;
+    *out_offset = 0.0f;
+    if (!str || len == 0) return;
+
+    char buf[128];
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    strncpy(buf, str, len);
+    buf[len] = '\0';
+
+    char* p = buf;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (_stricmp(p, "none") == 0) return;
+
+    for (char* cp = buf; *cp; ++cp) {
+        if (*cp == ',') *cp = ' ';
+    }
+
+    char* token = strtok(buf, " \t\r\n");
+    int count = 0;
+    while (token && count < MAX_DASH_COUNT) {
+        float val = (float)atof(token);
+        if (val >= 0.0f) {
+            out_dashes[count++] = val;
+        }
+        token = strtok(NULL, " \t\r\n");
+    }
+
+    if (count % 2 != 0 && count * 2 <= MAX_DASH_COUNT) {
+        for (int i = 0; i < count; ++i) {
+            out_dashes[count + i] = out_dashes[i];
+        }
+        count *= 2;
+    }
+
+    *out_count = count;
+}
+
 void SvgDocument_Free(SvgDocument* doc) {
     for (int i = 0; i < doc->node_count; ++i) {
         if (doc->nodes[i].type == SVG_NODE_PATH && doc->nodes[i].path) {
@@ -583,6 +627,7 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
     size_t val_len = 0;
     const char* val_ptr = NULL;
 
+    // 1. Root <svg ...> viewBox & Viewport Transformation
     const char* root_svg = strstr(buffer, "<svg");
     if (root_svg) {
         const char* root_end = strchr(root_svg, '>');
@@ -685,6 +730,7 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
             continue;
         }
 
+        // Group opening <g ...>
         if (strncmp(tag_open, "<g", 2) == 0 && (isspace((unsigned char)tag_open[2]) || tag_open[2] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
             if (tag_end) {
@@ -704,7 +750,7 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
                     if (t_str && t_len > 0) {
                         plutovg_matrix_t g_mat;
                         parse_svg_transform(t_str, t_len, &g_mat);
-                        plutovg_matrix_multiply(&g->matrix, &parent->matrix, &g_mat);
+                        plutovg_matrix_multiply(&g->matrix, &g_mat, &parent->matrix);
                     }
 
                     size_t a_len = 0;
@@ -726,12 +772,17 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
                         g->has_fill_rule = true;
                         g->fill_rule = (a_len >= 7 && strncmp(a_str, "evenodd", 7) == 0) ? PLUTOVG_FILL_RULE_EVEN_ODD : PLUTOVG_FILL_RULE_NON_ZERO;
                     }
+                    if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-dasharray", &a_len))) {
+                        parse_dash_array(a_str, a_len, g->dash_array, &g->dash_count, &g->dash_offset);
+                        g->has_dash = (g->dash_count > 0);
+                    }
                 }
                 cur = tag_end + 1;
                 continue;
             }
         }
 
+        // Vector Shapes
         bool is_path = (strncmp(tag_open, "<path", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>'));
         bool is_ellipse = (strncmp(tag_open, "<ellipse", 8) == 0 && (isspace((unsigned char)tag_open[8]) || tag_open[8] == '>'));
         bool is_circle = (strncmp(tag_open, "<circle", 7) == 0 && (isspace((unsigned char)tag_open[7]) || tag_open[7] == '>'));
@@ -753,6 +804,7 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
             size_t a_len = 0;
             const char* a_str = NULL;
 
+            // Geometry
             size_t d_len = 0;
             const char* d_str = find_prop_slice(tag_open, tag_end, "d", &d_len);
 
@@ -808,17 +860,20 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
                 }
             }
 
+            // Transform Matrix: elem_mat * group_matrix
             size_t t_len = 0;
             const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
             plutovg_matrix_t elem_mat;
             if (t_str && t_len > 0) parse_svg_transform(t_str, t_len, &elem_mat);
             else plutovg_matrix_init_identity(&elem_mat);
-            plutovg_matrix_multiply(&node->matrix, &group_stack[group_depth].matrix, &elem_mat);
+            plutovg_matrix_multiply(&node->matrix, &elem_mat, &group_stack[group_depth].matrix);
 
+            // Fill-rule
             size_t fr_len = 0;
             const char* fr_str = find_prop_slice(tag_open, tag_end, "fill-rule", &fr_len);
             if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
 
+            // Stroke & Fill
             node->stroke_width = group_stack[group_depth].has_stroke_width ? group_stack[group_depth].stroke_width : 1.0f;
             node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
             node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
@@ -831,6 +886,21 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
             if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-linecap", &a_len))) {
                 if (a_len >= 5 && strncmp(a_str, "round", 5) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_ROUND;
                 else if (a_len >= 6 && strncmp(a_str, "square", 6) == 0) node->stroke_cap = PLUTOVG_LINE_CAP_SQUARE;
+            }
+
+            // Dash array & offset
+            if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-dasharray", &a_len))) {
+                parse_dash_array(a_str, a_len, node->dash_array, &node->dash_count, &node->dash_offset);
+                node->has_dash = (node->dash_count > 0);
+            } else if (group_stack[group_depth].has_dash) {
+                node->has_dash = true;
+                node->dash_count = group_stack[group_depth].dash_count;
+                node->dash_offset = group_stack[group_depth].dash_offset;
+                memcpy(node->dash_array, group_stack[group_depth].dash_array, sizeof(float) * node->dash_count);
+            }
+
+            if ((a_str = find_prop_slice(tag_open, tag_end, "stroke-dashoffset", &a_len))) {
+                node->dash_offset = (float)atof(a_str);
             }
 
             plutovg_color_t black;
@@ -863,6 +933,7 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
             continue;
         }
 
+        // <text ...>content</text>
         if (strncmp(tag_open, "<text", 5) == 0 && (isspace((unsigned char)tag_open[5]) || tag_open[5] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
             const char* close_tag = strstr(tag_open, "</text>");
@@ -904,7 +975,7 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
                 plutovg_matrix_t elem_mat;
                 if (t_str && t_len > 0) parse_svg_transform(t_str, t_len, &elem_mat);
                 else plutovg_matrix_init_identity(&elem_mat);
-                plutovg_matrix_multiply(&node->matrix, &group_stack[group_depth].matrix, &elem_mat);
+                plutovg_matrix_multiply(&node->matrix, &elem_mat, &group_stack[group_depth].matrix);
 
                 const char* text_start = tag_end + 1;
                 size_t raw_len = (size_t)(close_tag - text_start);
@@ -929,7 +1000,6 @@ bool SvgDocument_LoadFromFile(SvgDocument* doc, const char* svg_path, SvgLogCall
 void SvgDocument_Render(const SvgDocument* doc, plutovg_canvas_t* canvas) {
     if (!doc || !canvas) return;
 
-    // White Artboard Background
     plutovg_canvas_save(canvas);
     plutovg_canvas_set_rgb(canvas, 1.0f, 1.0f, 1.0f);
     plutovg_canvas_fill_rect(canvas, 0, 0, doc->width, doc->height);
@@ -951,6 +1021,14 @@ void SvgDocument_Render(const SvgDocument* doc, plutovg_canvas_t* canvas) {
                 plutovg_canvas_set_line_width(canvas, node->stroke_width);
                 plutovg_canvas_set_line_join(canvas, node->stroke_join);
                 plutovg_canvas_set_line_cap(canvas, node->stroke_cap);
+
+                if (node->has_dash && node->dash_count > 0) {
+                    plutovg_canvas_set_dash_offset(canvas, node->dash_offset);
+                    plutovg_canvas_set_dash_array(canvas, node->dash_array, node->dash_count);
+                } else {
+                    plutovg_canvas_set_dash_array(canvas, NULL, 0);
+                }
+
                 plutovg_canvas_stroke_path(canvas, node->path);
             }
         } else if (node->type == SVG_NODE_TEXT) {
@@ -1040,6 +1118,17 @@ bool SvgDocument_ExportWithEmbeddedPaths(const SvgDocument* doc, const char* out
                 else if (node->stroke_join == PLUTOVG_LINE_JOIN_ROUND) fprintf(f, "stroke-linejoin=\"round\" ");
                 if (node->stroke_cap == PLUTOVG_LINE_CAP_ROUND) fprintf(f, "stroke-linecap=\"round\" ");
                 else if (node->stroke_cap == PLUTOVG_LINE_CAP_SQUARE) fprintf(f, "stroke-linecap=\"square\" ");
+
+                if (node->has_dash && node->dash_count > 0) {
+                    fprintf(f, "stroke-dasharray=\"");
+                    for (int d = 0; d < node->dash_count; ++d) {
+                        fprintf(f, "%g%s", node->dash_array[d], (d < node->dash_count - 1) ? "," : "");
+                    }
+                    fprintf(f, "\" ");
+                    if (node->dash_offset != 0.0f) {
+                        fprintf(f, "stroke-dashoffset=\"%g\" ", node->dash_offset);
+                    }
+                }
             }
             fprintf(f, "d=\"%s\"/>\n", psb.data);
 
