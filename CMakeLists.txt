@@ -25,6 +25,7 @@ FetchContent_MakeAvailable(plutovg plutosvg)
 
 set(SOURCES
     src/main.c
+    src/svg_engine.c
     src/font_helper.c
     res/app.rc
 )
