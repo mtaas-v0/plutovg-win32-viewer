@@ -19,9 +19,10 @@
 #define ID_MENU_RESET_VIEW   1004
 #define ID_MENU_TOGGLE_GRID  1005
 #define ID_MENU_TOGGLE_LOG   1006
-#define ID_MENU_ZOOM_IN      1007
-#define ID_MENU_ZOOM_OUT     1008
-#define ID_MENU_EXIT         1009
+#define ID_MENU_TOGGLE_CACHE 1007
+#define ID_MENU_ZOOM_IN      1008
+#define ID_MENU_ZOOM_OUT     1009
+#define ID_MENU_EXIT         1010
 
 #define IDC_LOG_EDIT         2001
 #define MAX_FONTS            64
@@ -101,6 +102,14 @@ typedef struct {
     int height;
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
+
+    // Offscreen Document Surface Cache for Instant High-FPS Rotation
+    bool use_cache;
+    bool cache_valid;
+    int cache_width;
+    int cache_height;
+    float cache_scale;
+    plutovg_surface_t* doc_cache_surface;
 
     char current_svg_path[MAX_PATH];
     char current_svg_name[128];
@@ -401,7 +410,7 @@ static void discover_fonts_for_svg(AppState* app, const char* svg_path) {
     }
 }
 
-// --- Zero-Copy Attribute & Transform Locator (No buffer truncations) ---
+// --- Zero-Copy Attribute & Transform Locator ---
 
 static const char* find_attr_slice(const char* tag_start, const char* tag_end, const char* attr_name, size_t* out_len) {
     if (!tag_start || !tag_end || tag_start >= tag_end || !attr_name) return NULL;
@@ -551,6 +560,99 @@ static void free_svg_doc(SvgDocument* doc) {
     doc->text_count = 0;
 }
 
+// --- High-Performance Document Surface Cache (Solves Rotation Lag) ---
+
+static void free_doc_cache(AppState* app) {
+    if (app->doc_cache_surface) {
+        plutovg_surface_destroy(app->doc_cache_surface);
+        app->doc_cache_surface = NULL;
+    }
+    app->cache_valid = false;
+}
+
+static void update_doc_cache(AppState* app) {
+    if (!app->has_svg_loaded || app->svg.width <= 0 || app->svg.height <= 0) return;
+
+    // Calculate optimal cache scale (capped to max 4096 to prevent VRAM overflow)
+    float target_scale = app->zoom;
+    if (target_scale < 1.0f) target_scale = 1.0f;
+    if (target_scale > 4.0f) target_scale = 4.0f;
+
+    int new_w = (int)(app->svg.width * target_scale + 0.5f);
+    int new_h = (int)(app->svg.height * target_scale + 0.5f);
+
+    if (new_w > 4096) new_w = 4096;
+    if (new_h > 4096) new_h = 4096;
+    if (new_w <= 0) new_w = 1;
+    if (new_h <= 0) new_h = 1;
+
+    // If cache already valid with similar resolution, skip re-rasterizing
+    if (app->cache_valid && app->doc_cache_surface &&
+        app->cache_width == new_w && app->cache_height == new_h) {
+        return;
+    }
+
+    free_doc_cache(app);
+
+    app->doc_cache_surface = plutovg_surface_create(new_w, new_h);
+    if (!app->doc_cache_surface) return;
+
+    app->cache_width = new_w;
+    app->cache_height = new_h;
+    app->cache_scale = target_scale;
+
+    plutovg_canvas_t* cache_canvas = plutovg_canvas_create(app->doc_cache_surface);
+    if (!cache_canvas) return;
+
+    // Clear with opaque white backing
+    plutovg_canvas_set_rgb(cache_canvas, 1.0f, 1.0f, 1.0f);
+    plutovg_canvas_fill_rect(cache_canvas, 0, 0, (float)new_w, (float)new_h);
+
+    // Apply base scaling into cache surface
+    plutovg_canvas_save(cache_canvas);
+    plutovg_canvas_scale(cache_canvas, target_scale, target_scale);
+
+    // Rasterize all paths and text nodes once (axis-aligned, highly optimized by CPU)
+    for (int i = 0; i < app->svg.node_count; ++i) {
+        SvgNode* node = &app->svg.nodes[i];
+
+        plutovg_canvas_save(cache_canvas);
+        plutovg_canvas_transform(cache_canvas, &node->matrix);
+
+        if (node->type == SVG_NODE_PATH && node->path) {
+            plutovg_canvas_set_fill_rule(cache_canvas, node->fill_rule);
+
+            if (node->has_fill) {
+                plutovg_canvas_set_color(cache_canvas, &node->fill_color);
+                plutovg_canvas_fill_path(cache_canvas, node->path);
+            }
+            if (node->has_stroke) {
+                plutovg_canvas_set_color(cache_canvas, &node->stroke_color);
+                plutovg_canvas_set_line_width(cache_canvas, node->stroke_width);
+                plutovg_canvas_set_line_join(cache_canvas, node->stroke_join);
+                plutovg_canvas_set_line_cap(cache_canvas, node->stroke_cap);
+                plutovg_canvas_stroke_path(cache_canvas, node->path);
+            }
+        } else if (node->type == SVG_NODE_TEXT) {
+            plutovg_font_face_t* face = registry_find_font(&app->registry, node->font_family);
+            if (face) {
+                plutovg_canvas_set_font_face(cache_canvas, face);
+                plutovg_canvas_set_font_size(cache_canvas, node->font_size);
+                plutovg_canvas_set_color(cache_canvas, &node->fill_color);
+                plutovg_canvas_fill_text(cache_canvas, node->text, node->text_len,
+                                        PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
+            }
+        }
+        plutovg_canvas_restore(cache_canvas);
+    }
+
+    plutovg_canvas_restore(cache_canvas);
+    plutovg_canvas_destroy(cache_canvas);
+    app->cache_valid = true;
+
+    log_append("[CACHE] Rendered unrotated layer cache (%dx%d, scale=%.2fx)", new_w, new_h, target_scale);
+}
+
 static void parse_svg(AppState* app, const char* svg_path) {
     FILE* f = fopen(svg_path, "rb");
     if (!f) return;
@@ -569,6 +671,8 @@ static void parse_svg(AppState* app, const char* svg_path) {
     fclose(f);
 
     free_svg_doc(&app->svg);
+    free_doc_cache(app);
+
     app->svg.width = 600.0f;
     app->svg.height = 400.0f;
 
@@ -611,10 +715,8 @@ static void parse_svg(AppState* app, const char* svg_path) {
                 node->path = plutovg_path_create();
                 node->fill_rule = PLUTOVG_FILL_RULE_NON_ZERO;
 
-                // Parse path directly from XML memory slice
                 plutovg_path_parse(node->path, d_str, (int)d_len);
 
-                // Transform
                 size_t t_len = 0;
                 const char* t_str = find_attr_slice(tag_open, tag_end, "transform", &t_len);
                 if (t_str && t_len > 0) {
@@ -623,14 +725,12 @@ static void parse_svg(AppState* app, const char* svg_path) {
                     plutovg_matrix_init_identity(&node->matrix);
                 }
 
-                // Fill-rule
                 size_t fr_len = 0;
                 const char* fr_str = find_attr_slice(tag_open, tag_end, "fill-rule", &fr_len);
                 if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) {
                     node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
                 }
 
-                // Stroke defaults
                 node->stroke_width = 1.0f;
                 node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
                 node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
@@ -715,8 +815,6 @@ static void parse_svg(AppState* app, const char* svg_path) {
 
                 if (node->text_len > 0) {
                     app->svg.text_count++;
-                    log_append("  [TEXT] family='%s', size=%.1f, len=%d, text='%s'",
-                               node->font_family, node->font_size, node->text_len, node->text);
                 } else {
                     app->svg.node_count--;
                 }
@@ -731,6 +829,8 @@ static void parse_svg(AppState* app, const char* svg_path) {
 
     log_append("[RESULT] Loaded %d paths and %d text nodes successfully.", app->svg.path_count, app->svg.text_count);
     free(buffer);
+
+    update_doc_cache(app);
 }
 
 static void reset_view(AppState* app) {
@@ -795,7 +895,7 @@ static void svg_path_traverse_cb(void* closure, plutovg_path_command_t command, 
     }
 }
 
-// --- Export SVG with Glyphs Converted to Vector Paths ---
+// --- Export Standalone SVG with Embedded Glyph Contours ---
 static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) {
     if (!app->has_svg_loaded) return false;
 
@@ -825,11 +925,8 @@ static bool export_svg_with_embedded_paths(AppState* app, const char* out_path) 
             fprintf(f, "  <path transform=\"matrix(%g,%g,%g,%g,%g,%g)\" ",
                     node->matrix.a, node->matrix.b, node->matrix.c, node->matrix.d, node->matrix.e, node->matrix.f);
 
-            if (node->fill_rule == PLUTOVG_FILL_RULE_EVEN_ODD) {
-                fprintf(f, "fill-rule=\"evenodd\" ");
-            } else {
-                fprintf(f, "fill-rule=\"nonzero\" ");
-            }
+            if (node->fill_rule == PLUTOVG_FILL_RULE_EVEN_ODD) fprintf(f, "fill-rule=\"evenodd\" ");
+            else fprintf(f, "fill-rule=\"nonzero\" ");
 
             if (node->has_fill) {
                 fprintf(f, "fill=\"#%02X%02X%02X\" ",
@@ -966,15 +1063,18 @@ static void draw_grid_and_origin(plutovg_canvas_t* canvas) {
     plutovg_canvas_restore(canvas);
 }
 
+// --- 60+ FPS Viewport Composition (Texture Cache vs Direct Render) ---
 static void render(AppState* app) {
     if (!app->canvas) return;
 
+    // 1. Background
     plutovg_canvas_save(app->canvas);
     plutovg_canvas_reset_matrix(app->canvas);
     plutovg_canvas_set_rgb(app->canvas, 0.12f, 0.13f, 0.15f);
     plutovg_canvas_fill_rect(app->canvas, 0, 0, (float)app->width, (float)app->height);
     plutovg_canvas_restore(app->canvas);
 
+    // 2. Viewport Transform
     plutovg_canvas_save(app->canvas);
     plutovg_canvas_translate(app->canvas, app->pan_x, app->pan_y);
     plutovg_canvas_scale(app->canvas, app->zoom, app->zoom);
@@ -989,45 +1089,55 @@ static void render(AppState* app) {
     if (app->show_grid) draw_grid_and_origin(app->canvas);
 
     if (app->has_svg_loaded) {
-        plutovg_canvas_save(app->canvas);
-        plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
-        plutovg_canvas_fill_rect(app->canvas, 0, 0, app->svg.width, app->svg.height);
-        plutovg_canvas_restore(app->canvas);
+        // Fast Texture Cache Rendering Path (Instantaneous rotation & pan at 60+ FPS)
+        if (app->use_cache && app->cache_valid && app->doc_cache_surface) {
+            plutovg_matrix_t tex_mat;
+            plutovg_matrix_init_scale(&tex_mat,
+                                      (float)app->svg.width / (float)app->cache_width,
+                                      (float)app->svg.height / (float)app->cache_height);
 
-        for (int i = 0; i < app->svg.node_count; ++i) {
-            SvgNode* node = &app->svg.nodes[i];
-
+            plutovg_canvas_set_texture(app->canvas, app->doc_cache_surface, PLUTOVG_TEXTURE_TYPE_PLAIN, 1.0f, &tex_mat);
+            plutovg_canvas_fill_rect(app->canvas, 0, 0, app->svg.width, app->svg.height);
+        } else {
+            // Full Direct Vector Path
             plutovg_canvas_save(app->canvas);
-            plutovg_canvas_transform(app->canvas, &node->matrix);
-
-            if (node->type == SVG_NODE_PATH && node->path) {
-                // Apply winding rule (crucial for hollow glyphs like R, 8, B, O)
-                plutovg_canvas_set_fill_rule(app->canvas, node->fill_rule);
-
-                if (node->has_fill) {
-                    plutovg_canvas_set_color(app->canvas, &node->fill_color);
-                    plutovg_canvas_fill_path(app->canvas, node->path);
-                }
-                if (node->has_stroke) {
-                    plutovg_canvas_set_color(app->canvas, &node->stroke_color);
-                    plutovg_canvas_set_line_width(app->canvas, node->stroke_width);
-                    plutovg_canvas_set_line_join(app->canvas, node->stroke_join);
-                    plutovg_canvas_set_line_cap(app->canvas, node->stroke_cap);
-                    plutovg_canvas_stroke_path(app->canvas, node->path);
-                }
-            } else if (node->type == SVG_NODE_TEXT) {
-                plutovg_font_face_t* face = registry_find_font(&app->registry, node->font_family);
-                if (face) {
-                    plutovg_canvas_set_font_face(app->canvas, face);
-                    plutovg_canvas_set_font_size(app->canvas, node->font_size);
-                    plutovg_canvas_set_color(app->canvas, &node->fill_color);
-
-                    plutovg_canvas_fill_text(app->canvas, node->text, node->text_len,
-                                            PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
-                }
-            }
-
+            plutovg_canvas_set_rgb(app->canvas, 1.0f, 1.0f, 1.0f);
+            plutovg_canvas_fill_rect(app->canvas, 0, 0, app->svg.width, app->svg.height);
             plutovg_canvas_restore(app->canvas);
+
+            for (int i = 0; i < app->svg.node_count; ++i) {
+                SvgNode* node = &app->svg.nodes[i];
+
+                plutovg_canvas_save(app->canvas);
+                plutovg_canvas_transform(app->canvas, &node->matrix);
+
+                if (node->type == SVG_NODE_PATH && node->path) {
+                    plutovg_canvas_set_fill_rule(app->canvas, node->fill_rule);
+
+                    if (node->has_fill) {
+                        plutovg_canvas_set_color(app->canvas, &node->fill_color);
+                        plutovg_canvas_fill_path(app->canvas, node->path);
+                    }
+                    if (node->has_stroke) {
+                        plutovg_canvas_set_color(app->canvas, &node->stroke_color);
+                        plutovg_canvas_set_line_width(app->canvas, node->stroke_width);
+                        plutovg_canvas_set_line_join(app->canvas, node->stroke_join);
+                        plutovg_canvas_set_line_cap(app->canvas, node->stroke_cap);
+                        plutovg_canvas_stroke_path(app->canvas, node->path);
+                    }
+                } else if (node->type == SVG_NODE_TEXT) {
+                    plutovg_font_face_t* face = registry_find_font(&app->registry, node->font_family);
+                    if (face) {
+                        plutovg_canvas_set_font_face(app->canvas, face);
+                        plutovg_canvas_set_font_size(app->canvas, node->font_size);
+                        plutovg_canvas_set_color(app->canvas, &node->fill_color);
+
+                        plutovg_canvas_fill_text(app->canvas, node->text, node->text_len,
+                                                PLUTOVG_TEXT_ENCODING_UTF8, node->x, node->y);
+                    }
+                }
+                plutovg_canvas_restore(app->canvas);
+            }
         }
     }
 
@@ -1042,6 +1152,14 @@ static void zoom_at(AppState* app, float sx, float sy, float factor) {
     app->pan_x = sx - (sx - app->pan_x) * (new_zoom / app->zoom);
     app->pan_y = sy - (sy - app->pan_y) * (new_zoom / app->zoom);
     app->zoom = new_zoom;
+
+    // Refresh resolution of the cache if zoom changed substantially
+    if (app->use_cache && app->has_svg_loaded) {
+        float ratio = app->zoom / (app->cache_scale > 0 ? app->cache_scale : 1.0f);
+        if (ratio > 1.8f || ratio < 0.5f) {
+            update_doc_cache(app);
+        }
+    }
 }
 
 static bool browse_file(HWND parent, const char* filter, char* out_path, size_t max_len, bool is_save) {
@@ -1093,6 +1211,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CREATE: {
         DragAcceptFiles(hwnd, TRUE);
         g_app.show_grid = true;
+        g_app.use_cache = true; // High-FPS Rotation Cache ON by default
         g_app.zoom = 1.0f;
         return 0;
     }
@@ -1177,6 +1296,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.pan_y -= pan_step;
             InvalidateRect(hwnd, NULL, FALSE);
             break;
+        case 'C':
+            SendMessage(hwnd, WM_COMMAND, ID_MENU_TOGGLE_CACHE, 0);
+            break;
         case 'E':
             if (ctrl) SendMessage(hwnd, WM_COMMAND, ID_MENU_EXPORT_SVG, 0);
             break;
@@ -1223,6 +1345,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 load_svg_file(&g_app, file);
             } else if (_stricmp(ext, ".ttf") == 0 || _stricmp(ext, ".otf") == 0 || _stricmp(ext, ".ttc") == 0) {
                 registry_add_font(&g_app.registry, PathFindFileNameA(file), file);
+                update_doc_cache(&g_app);
             }
             InvalidateRect(hwnd, NULL, FALSE);
         }
@@ -1244,6 +1367,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             char path[MAX_PATH];
             if (browse_file(hwnd, "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0", path, sizeof(path), false)) {
                 registry_add_font(&g_app.registry, PathFindFileNameA(path), path);
+                update_doc_cache(&g_app);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             break;
@@ -1265,6 +1389,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case ID_MENU_TOGGLE_GRID:
             g_app.show_grid = !g_app.show_grid;
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case ID_MENU_TOGGLE_CACHE:
+            g_app.use_cache = !g_app.use_cache;
+            if (g_app.use_cache) update_doc_cache(&g_app);
+            CheckMenuItem(GetMenu(hwnd), ID_MENU_TOGGLE_CACHE, g_app.use_cache ? MF_CHECKED : MF_UNCHECKED);
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         case ID_MENU_TOGGLE_LOG:
@@ -1315,6 +1445,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 1;
 
     case WM_DESTROY:
+        free_doc_cache(&g_app);
         free_svg_doc(&g_app.svg);
         registry_init(&g_app.registry);
         if (g_app.hfont_log) DeleteObject(g_app.hfont_log);
@@ -1341,6 +1472,7 @@ static void create_app_menu(HWND hwnd) {
 
     AppendMenuA(hViewMenu, MF_STRING, ID_MENU_RESET_VIEW, "&Reset View\t(Space)");
     AppendMenuA(hViewMenu, MF_STRING, ID_MENU_TOGGLE_GRID, "Toggle &Grid & Origin\t(G)");
+    AppendMenuA(hViewMenu, MF_STRING | MF_CHECKED, ID_MENU_TOGGLE_CACHE, "Fast &Texture Cache (Smooth Rotation)\t(C)");
     AppendMenuA(hViewMenu, MF_STRING | MF_UNCHECKED, ID_MENU_TOGGLE_LOG, "Show Debug &Log\t(L)");
 
     AppendMenuA(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, "&File");
@@ -1398,7 +1530,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     );
     if (!g_app.hwnd_main) return 1;
 
-    // 4. Create Modeless Popup Log Window (Hidden by Default)
+    // 4. Create Modeless Popup Log Window
     g_app.hwnd_log = CreateWindowExA(
         WS_EX_TOOLWINDOW,
         log_wc.lpszClassName,
@@ -1443,6 +1575,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         { FCONTROL | FVIRTKEY, 'O', ID_MENU_OPEN_SVG },
         { FCONTROL | FVIRTKEY, 'E', ID_MENU_EXPORT_SVG },
         { FVIRTKEY, 'O', ID_MENU_OPEN_FONT },
+        { FVIRTKEY, 'C', ID_MENU_TOGGLE_CACHE },
         { FVIRTKEY, 'L', ID_MENU_TOGGLE_LOG },
         { FVIRTKEY, 'G', ID_MENU_TOGGLE_GRID },
         { FVIRTKEY, VK_SPACE, ID_MENU_RESET_VIEW },
