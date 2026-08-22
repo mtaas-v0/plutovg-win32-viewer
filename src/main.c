@@ -54,7 +54,7 @@
 #define MAX_SVG_NODES             16384
 #define MAX_ANNOTATIONS           512
 #define MAX_CATEGORIES            9
-#define MAX_GROUP_DEPTH           32
+#define MAX_GROUP_DEPTH           64
 
 typedef enum {
     APP_MODE_NAVIGATE,
@@ -193,7 +193,6 @@ typedef struct {
     float drag_curr_canvas_x;
     float drag_curr_canvas_y;
 
-    // Annotation Data & Settings
     AppInteractionMode interaction_mode;
     bool annotations_selectable;
     bool is_dirty;
@@ -203,13 +202,11 @@ typedef struct {
     int active_class_id;
     char annot_file_path[MAX_PATH];
 
-    // Canvas Surface
     int width;
     int height;
     plutovg_surface_t* surface;
     plutovg_canvas_t* canvas;
 
-    // Fonts & SVG
     char current_svg_path[MAX_PATH];
     char current_svg_name[128];
     char fonts_dir[MAX_PATH];
@@ -859,7 +856,7 @@ static const char* find_attr_slice(const char* tag_start, const char* tag_end, c
                     const char* val_start = quote + 1;
                     const char* val_end = val_start;
                     while (val_end < tag_end && *val_end != qchar) val_end++;
-                    if (val_end <= tag_end) {
+                    if (val_end < tag_end && *val_end == qchar) {
                         *out_len = (size_t)(val_end - val_start);
                         return val_start;
                     }
@@ -874,7 +871,6 @@ static const char* find_attr_slice(const char* tag_start, const char* tag_end, c
 static const char* find_prop_slice(const char* tag_start, const char* tag_end, const char* prop_name, size_t* out_len) {
     if (!tag_start || !tag_end || tag_start >= tag_end || !prop_name) return NULL;
 
-    // 1. Direct attribute: prop="val"
     size_t direct_len = 0;
     const char* direct_val = find_attr_slice(tag_start, tag_end, prop_name, &direct_len);
     if (direct_val && direct_len > 0) {
@@ -882,7 +878,6 @@ static const char* find_prop_slice(const char* tag_start, const char* tag_end, c
         return direct_val;
     }
 
-    // 2. CSS inline style: style="...; prop: val; ..."
     size_t style_len = 0;
     const char* style_str = find_attr_slice(tag_start, tag_end, "style", &style_len);
     if (style_str && style_len > 0) {
@@ -918,7 +913,15 @@ static const char* find_prop_slice(const char* tag_start, const char* tag_end, c
     return NULL;
 }
 
-// Complete SVG Transform Matrix Parser (handles matrix, translate, scale, 3-param rotate, skewX, skewY)
+// True XML Self-Closing Tag Check (whitespace-tolerant)
+static bool is_self_closing_tag(const char* tag_open, const char* tag_end) {
+    if (!tag_open || !tag_end || tag_end <= tag_open) return false;
+    const char* p = tag_end - 1;
+    while (p > tag_open && isspace((unsigned char)*p)) p--;
+    return (p > tag_open && *p == '/');
+}
+
+// Comprehensive SVG Transform Matrix Parser
 static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* out_mat) {
     plutovg_matrix_init_identity(out_mat);
     if (!str || len == 0) return;
@@ -982,7 +985,6 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
             int count = sscanf(buf, "%f %f %f", &angle, &cx, &cy);
             float rad = angle * (3.14159265358979323846f / 180.0f);
             if (count == 3) {
-                // rotate(angle, cx, cy) = translate(cx, cy) * rotate(angle) * translate(-cx, -cy)
                 plutovg_matrix_t t1, r, t2;
                 plutovg_matrix_init_translate(&t1, cx, cy);
                 plutovg_matrix_init_rotate(&r, rad);
@@ -1014,7 +1016,7 @@ static void parse_svg_transform(const char* str, size_t len, plutovg_matrix_t* o
     }
 }
 
-// Full Hex / RGB / Name Color Parser
+// Color Parser supporting #RGB, #RRGGBB, #RRGGBBAA, rgb(), rgba(), and color names
 static void parse_color_slice(const char* val, size_t len, bool* has_paint, plutovg_color_t* color, plutovg_color_t default_color) {
     if (!val || len == 0) { *has_paint = false; return; }
 
@@ -1059,6 +1061,32 @@ static void parse_color_slice(const char* val, size_t len, bool* has_paint, plut
                 *has_paint = true;
                 return;
             }
+        }
+    }
+
+    if (_strnicmp(p, "rgb(", 4) == 0) {
+        float r = 0, g = 0, b = 0;
+        char cbuf[64];
+        strncpy(cbuf, p + 4, sizeof(cbuf) - 1);
+        cbuf[sizeof(cbuf) - 1] = '\0';
+        for (char* cp = cbuf; *cp; ++cp) if (*cp == ',' || *cp == ')') *cp = ' ';
+        if (sscanf(cbuf, "%f %f %f", &r, &g, &b) == 3) {
+            plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
+            *has_paint = true;
+            return;
+        }
+    }
+
+    if (_strnicmp(p, "rgba(", 5) == 0) {
+        float r = 0, g = 0, b = 0, a = 1.0f;
+        char cbuf[64];
+        strncpy(cbuf, p + 5, sizeof(cbuf) - 1);
+        cbuf[sizeof(cbuf) - 1] = '\0';
+        for (char* cp = cbuf; *cp; ++cp) if (*cp == ',' || *cp == ')') *cp = ' ';
+        if (sscanf(cbuf, "%f %f %f %f", &r, &g, &b, &a) == 4) {
+            plutovg_color_init_rgba(color, r / 255.0f, g / 255.0f, b / 255.0f, a);
+            *has_paint = true;
+            return;
         }
     }
 
@@ -1136,15 +1164,11 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
     size_t val_len = 0;
     const char* val_ptr = NULL;
 
-    // Parse Root <svg ...> viewBox & Viewport Transformation
+    // 1. Parse Root <svg ...> viewBox & Viewport Transformation
     const char* root_svg = strstr(buffer, "<svg");
     if (root_svg) {
         const char* root_end = strchr(root_svg, '>');
         if (root_end) {
-            float doc_w = 0.0f, doc_h = 0.0f;
-            if ((val_ptr = find_prop_slice(root_svg, root_end, "width", &val_len))) doc_w = (float)atof(val_ptr);
-            if ((val_ptr = find_prop_slice(root_svg, root_end, "height", &val_len))) doc_h = (float)atof(val_ptr);
-
             float vb_x = 0, vb_y = 0, vb_w = 0, vb_h = 0;
             bool has_viewbox = false;
             if ((val_ptr = find_prop_slice(root_svg, root_end, "viewBox", &val_len))) {
@@ -1159,21 +1183,39 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
                 }
             }
 
+            float doc_w = 0.0f, doc_h = 0.0f;
+            bool has_explicit_w = false, has_explicit_h = false;
+
+            if ((val_ptr = find_prop_slice(root_svg, root_end, "width", &val_len))) {
+                // Ignore percentages like "100%"
+                if (memchr(val_ptr, '%', val_len) == NULL) {
+                    doc_w = (float)atof(val_ptr);
+                    if (doc_w > 0) has_explicit_w = true;
+                }
+            }
+            if ((val_ptr = find_prop_slice(root_svg, root_end, "height", &val_len))) {
+                if (memchr(val_ptr, '%', val_len) == NULL) {
+                    doc_h = (float)atof(val_ptr);
+                    if (doc_h > 0) has_explicit_h = true;
+                }
+            }
+
             if (has_viewbox) {
-                if (doc_w <= 0 || doc_h <= 0) {
-                    doc->width = vb_w;
-                    doc->height = vb_h;
-                    plutovg_matrix_init_translate(&group_stack[0].matrix, -vb_x, -vb_y);
-                } else {
+                if (has_explicit_w && has_explicit_h) {
                     doc->width = doc_w;
                     doc->height = doc_h;
                     float sx = doc_w / vb_w;
                     float sy = doc_h / vb_h;
                     plutovg_matrix_init(&group_stack[0].matrix, sx, 0, 0, sy, -vb_x * sx, -vb_y * sy);
+                } else {
+                    doc->width = vb_w;
+                    doc->height = vb_h;
+                    plutovg_matrix_init_translate(&group_stack[0].matrix, -vb_x, -vb_y);
                 }
             } else {
-                if (doc_w > 0) doc->width = doc_w;
-                if (doc_h > 0) doc->height = doc_h;
+                doc->width = has_explicit_w ? doc_w : 800.0f;
+                doc->height = has_explicit_h ? doc_h : 600.0f;
+                plutovg_matrix_init_identity(&group_stack[0].matrix);
             }
         }
     }
@@ -1190,19 +1232,22 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             continue;
         }
 
-        // Skip non-rendering containers (<defs>, <clipPath>, <mask, <pattern, <symbol)
+        // Skip non-rendering containers (<defs>, <clipPath>, <mask, <pattern, <symbol, <style, <script)
         if (strncmp(tag_open, "<defs", 5) == 0 || strncmp(tag_open, "<clipPath", 9) == 0 ||
             strncmp(tag_open, "<mask", 5) == 0 || strncmp(tag_open, "<pattern", 8) == 0 ||
-            strncmp(tag_open, "<symbol", 7) == 0) {
+            strncmp(tag_open, "<symbol", 7) == 0 || strncmp(tag_open, "<style", 6) == 0 ||
+            strncmp(tag_open, "<script", 7) == 0) {
             const char* tag_end = strchr(tag_open, '>');
             if (tag_end) {
-                if (*(tag_end - 1) == '/') { cur = tag_end + 1; continue; }
+                if (is_self_closing_tag(tag_open, tag_end)) { cur = tag_end + 1; continue; }
                 const char* close_tag = NULL;
                 if (strncmp(tag_open, "<defs", 5) == 0) close_tag = strstr(tag_end, "</defs>");
                 else if (strncmp(tag_open, "<clipPath", 9) == 0) close_tag = strstr(tag_end, "</clipPath>");
                 else if (strncmp(tag_open, "<mask", 5) == 0) close_tag = strstr(tag_end, "</mask>");
                 else if (strncmp(tag_open, "<pattern", 8) == 0) close_tag = strstr(tag_end, "</pattern>");
                 else if (strncmp(tag_open, "<symbol", 7) == 0) close_tag = strstr(tag_end, "</symbol>");
+                else if (strncmp(tag_open, "<style", 6) == 0) close_tag = strstr(tag_end, "</style>");
+                else if (strncmp(tag_open, "<script", 7) == 0) close_tag = strstr(tag_end, "</script>");
 
                 if (close_tag) {
                     const char* close_end = strchr(close_tag, '>');
@@ -1220,12 +1265,18 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             continue;
         }
 
+        // Any generic closing tag </...>
+        if (tag_open[1] == '/') {
+            const char* tag_end = strchr(tag_open, '>');
+            cur = tag_end ? tag_end + 1 : tag_open + 2;
+            continue;
+        }
+
         // Group opening <g ...>
         if (strncmp(tag_open, "<g", 2) == 0 && (isspace((unsigned char)tag_open[2]) || tag_open[2] == '>')) {
             const char* tag_end = strchr(tag_open, '>');
             if (tag_end) {
-                // If self-closing `<g ... />`, skip without increasing depth
-                if (*(tag_end - 1) == '/') {
+                if (is_self_closing_tag(tag_open, tag_end)) {
                     cur = tag_end + 1;
                     continue;
                 }
@@ -1347,7 +1398,7 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
                 }
             }
 
-            // 2. Transform Matrix: Parent Group Matrix * Local Element Matrix
+            // 2. Transform Matrix
             size_t t_len = 0;
             const char* t_str = find_prop_slice(tag_open, tag_end, "transform", &t_len);
             plutovg_matrix_t elem_mat;
@@ -1360,7 +1411,7 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             const char* fr_str = find_prop_slice(tag_open, tag_end, "fill-rule", &fr_len);
             if (fr_str && fr_len >= 7 && strncmp(fr_str, "evenodd", 7) == 0) node->fill_rule = PLUTOVG_FILL_RULE_EVEN_ODD;
 
-            // 4. Stroke & Fill Properties (Honors direct attributes, CSS styles, and group inheritance)
+            // 4. Stroke & Fill Properties
             node->stroke_width = group_stack[group_depth].has_stroke_width ? group_stack[group_depth].stroke_width : 1.0f;
             node->stroke_join = PLUTOVG_LINE_JOIN_MITER;
             node->stroke_cap = PLUTOVG_LINE_CAP_BUTT;
@@ -1378,7 +1429,6 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
             plutovg_color_t black;
             plutovg_color_init_rgb(&black, 0, 0, 0);
 
-            // Check Stroke
             const char* stroke_val = find_prop_slice(tag_open, tag_end, "stroke", &a_len);
             if (stroke_val) {
                 parse_color_slice(stroke_val, a_len, &node->has_stroke, &node->stroke_color, black);
@@ -1387,7 +1437,6 @@ static void parse_svg_document(SvgDocument* doc, const char* svg_path) {
                 node->stroke_color = group_stack[group_depth].stroke_color;
             }
 
-            // Check Fill
             const char* fill_val = find_prop_slice(tag_open, tag_end, "fill", &a_len);
             if (fill_val) {
                 parse_color_slice(fill_val, a_len, &node->has_fill, &node->fill_color, black);
